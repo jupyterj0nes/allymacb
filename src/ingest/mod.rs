@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::error::{AllyError, ErrorCode, Result};
 use crate::parsers::fs_walk::walk_directory_timeline;
 use crate::parsers::mft::{parse_mft_file, MftParseOptions, ResidentStats};
 use crate::parsers::usn::{parse_usn_file, UsnParseOptions};
@@ -19,10 +20,14 @@ pub struct EvidenceWorkspace {
 }
 
 impl EvidenceWorkspace {
-    pub fn new() -> std::io::Result<Self> {
+    pub fn new() -> Result<Self> {
         let unique_id = format!("allymacb_{}_{}", std::process::id(), uuid_or_random());
         let temp_dir = std::env::temp_dir().join(unique_id);
-        fs::create_dir_all(&temp_dir)?;
+        fs::create_dir_all(&temp_dir).map_err(|e| AllyError::Io {
+            code: ErrorCode::IoError,
+            source: e,
+            context: format!("Creating workspace directory {}", temp_dir.display()),
+        })?;
         Ok(Self { temp_dir })
     }
 
@@ -53,7 +58,7 @@ pub fn process_evidence_inputs(
     directories: &[PathBuf],
     usn_file: Option<&PathBuf>,
     mft_options: &MftParseOptions,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
     let workspace = EvidenceWorkspace::new()?;
     let mut combined_timeline = Vec::new();
     let mut total_resident_stats = ResidentStats::default();
@@ -147,7 +152,6 @@ pub fn process_evidence_inputs(
                         }
                     }
                     _ => {
-                        // Attempt generic directory walk / single file timeline
                         if let Ok(entries) = walk_directory_timeline(file_path) {
                             combined_timeline.extend(entries);
                         }
@@ -198,7 +202,7 @@ fn process_directory_internal(
     dir_path: &Path,
     mft_options: &MftParseOptions,
     temp_dir: &Path,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
     let mut combined_timeline = Vec::new();
     let mut total_resident_stats = ResidentStats::default();
 

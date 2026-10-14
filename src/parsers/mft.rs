@@ -9,10 +9,11 @@ use mft::attribute::x30::FileNameAttr;
 use mft::attribute::MftAttributeContent;
 use mft::MftParser;
 
+use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::format_unix_timestamp;
 use crate::timeline::{join_macb_flags, TimelineEntry};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MftParseOptions {
     pub include_file_name_timestamps: bool,
     pub resident_dir: Option<PathBuf>,
@@ -21,7 +22,7 @@ pub struct MftParseOptions {
     pub quiet: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ResidentStats {
     pub total_extracted: usize,
     pub total_bytes: u64,
@@ -56,8 +57,13 @@ impl TimestampCollector {
 pub fn parse_mft_reader<R: Read + Seek>(
     reader: R,
     options: &MftParseOptions,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
-    let mut parser = MftParser::from_read_seek(reader, None)?;
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    let mut parser = MftParser::from_read_seek(reader, None).map_err(|e| AllyError::Mft {
+        code: ErrorCode::MftInitFailed,
+        entry: None,
+        message: format!("Failed to initialize MFT parser: {}", e),
+    })?;
+
     let entry_count = parser.get_entry_count();
 
     let pb = if !options.quiet {
@@ -270,7 +276,11 @@ pub fn parse_mft_reader<R: Read + Seek>(
 
     // Write resident extraction report if requested
     if let Some(ref report_path) = options.resident_report {
-        let mut rep = File::create(report_path)?;
+        let mut rep = File::create(report_path).map_err(|e| AllyError::Io {
+            code: ErrorCode::IoError,
+            source: e,
+            context: format!("Creating resident report {}", report_path.display()),
+        })?;
         writeln!(rep, "=== Resident Files Extraction Summary ===")?;
         writeln!(rep, "Total resident files extracted: {}", resident_stats.total_extracted)?;
         writeln!(rep, "Total bytes extracted: {} bytes ({:.2} MB)", resident_stats.total_bytes, resident_stats.total_bytes as f64 / 1_048_576.0)?;
@@ -282,8 +292,12 @@ pub fn parse_mft_reader<R: Read + Seek>(
 pub fn parse_mft_file(
     mft_path: &Path,
     options: &MftParseOptions,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(mft_path)?;
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    let file = File::open(mft_path).map_err(|e| AllyError::Io {
+        code: ErrorCode::FileNotFound,
+        source: e,
+        context: format!("Opening MFT file {}", mft_path.display()),
+    })?;
     let reader = BufReader::new(file);
     parse_mft_reader(reader, options)
 }
@@ -294,7 +308,6 @@ fn extract_resident_file(
     data: &[u8],
     stats: &mut ResidentStats,
 ) {
-    // Sanitize path for safe filesystem extraction
     let clean_path = file_path
         .replace(":\\", "/")
         .replace(":/", "/")

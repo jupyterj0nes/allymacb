@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use ext4_view::{Ext4, Ext4Read};
 
+use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::format_unix_timestamp;
 use crate::timeline::{join_macb_flags, TimelineEntry};
 
@@ -23,7 +24,7 @@ impl<R: Read + Seek + Send + 'static> Ext4Read for PartitionReader<R> {
         &mut self,
         start_byte: u64,
         dst: &mut [u8],
-    ) -> Result<(), Box<dyn core::error::Error + Send + Sync + 'static>> {
+    ) -> std::result::Result<(), Box<dyn core::error::Error + Send + Sync + 'static>> {
         let mut guard = self.inner.lock().map_err(|_| "Mutex poisoned")?;
         guard.seek(SeekFrom::Start(self.offset + start_byte))?;
         guard.read_exact(dst)?;
@@ -58,13 +59,14 @@ pub fn mode_to_string(mode: u16, is_dir: bool, is_symlink: bool) -> String {
 pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
     reader: Arc<Mutex<R>>,
     partition_offset: u64,
-) -> Result<Vec<TimelineEntry>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<TimelineEntry>> {
     let part_reader = PartitionReader::new(reader, partition_offset);
-    let fs = Ext4::load(Box::new(part_reader))?;
+    let fs = Ext4::load(Box::new(part_reader)).map_err(|e| AllyError::Ext4 {
+        code: ErrorCode::Ext4SuperblockInvalid,
+        message: format!("Failed loading ext4 filesystem at offset 0x{:X}: {:?}", partition_offset, e),
+    })?;
 
     let mut timeline = Vec::new();
-
-    // Start recursive traversal from root "/"
     let mut stack = vec!["/".to_string()];
 
     while let Some(current_path) = stack.pop() {
@@ -82,7 +84,6 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
             let name = entry.file_name();
             let name_str = String::from_utf8_lossy(name.as_ref()).to_string();
 
-            // Skip "." and ".."
             if name_str == "." || name_str == ".." {
                 continue;
             }
@@ -105,10 +106,8 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
             let uid = meta.uid();
             let gid = meta.gid();
 
-            // Group timestamps by (secs, nanos)
             let mut ts_map: HashMap<(i64, u32), String> = HashMap::new();
 
-            // Modified ('m')
             let m_ts = meta.modified();
             let m_secs = m_ts.seconds();
             let m_nanos = m_ts.nanoseconds();
@@ -117,7 +116,6 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
                 *current = join_macb_flags(current, 'm');
             }
 
-            // Accessed ('a')
             let a_ts = meta.accessed();
             let a_secs = a_ts.seconds();
             let a_nanos = a_ts.nanoseconds();
@@ -126,7 +124,6 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
                 *current = join_macb_flags(current, 'a');
             }
 
-            // Created / Birth ('b')
             if let Some(c_ts) = meta.created() {
                 let c_secs = c_ts.seconds();
                 let c_nanos = c_ts.nanoseconds();
@@ -147,13 +144,12 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
                         mode_str.clone(),
                         uid,
                         gid,
-                        "0".to_string(), // Inode placeholder
+                        "0".to_string(),
                         entry_path.clone(),
                     ));
                 }
             }
 
-            // If directory, push to stack for recursive exploration
             if is_dir {
                 stack.push(entry_path);
             }

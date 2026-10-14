@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ntfs::Ntfs;
 
+use crate::error::{AllyError, ErrorCode, Result};
 use crate::parsers::ext4::parse_ext4_partition;
 use crate::parsers::mft::{MftParseOptions, ResidentStats};
 use crate::timeline::TimelineEntry;
@@ -153,7 +154,7 @@ pub fn parse_forensic_image(
     image_path: &Path,
     mft_options: &MftParseOptions,
     temp_dir: &Path,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
     let mut combined_timeline = Vec::new();
     let mut total_stats = ResidentStats::default();
 
@@ -164,9 +165,12 @@ pub fn parse_forensic_image(
         .to_lowercase();
 
     if ext == "e01" || ext == "ex01" {
-        // Open E01 image with ewf
         let path_str = image_path.to_string_lossy().to_string();
-        let ewf_reader = ewf::EwfReader::open(&path_str)?;
+        let ewf_reader = ewf::EwfReader::open(&path_str).map_err(|e| AllyError::Image {
+            code: ErrorCode::ImageReadFailed,
+            path: path_str.clone(),
+            message: format!("Failed opening E01 image: {}", e),
+        })?;
         let total_size = ewf_reader.total_size();
         let mut buf_reader = BufReader::new(ewf_reader);
 
@@ -182,23 +186,33 @@ pub fn parse_forensic_image(
                     }
                 }
                 PartitionType::Ext4 => {
-                    // ext4 on E01 reader
                     let reader_arc = Arc::new(Mutex::new(buf_reader));
                     if let Ok(timeline) = parse_ext4_partition(reader_arc.clone(), part.offset) {
                         combined_timeline.extend(timeline);
                     }
                     buf_reader = Arc::try_unwrap(reader_arc)
-                        .map_err(|_| "Arc unwrap failed")?
+                        .map_err(|_| AllyError::Image {
+                            code: ErrorCode::ImageReadFailed,
+                            path: path_str.clone(),
+                            message: "Failed unfreezing Arc reader for E01".to_string(),
+                        })?
                         .into_inner()
-                        .map_err(|_| "Mutex into_inner failed")?;
+                        .map_err(|_| AllyError::Image {
+                            code: ErrorCode::ImageReadFailed,
+                            path: path_str.clone(),
+                            message: "Mutex poisoned on E01 reader".to_string(),
+                        })?;
                 }
                 PartitionType::Unknown => {}
             }
         }
     } else {
-        // Raw image (.dd, .raw, .img, .001, etc.)
-        let file = File::open(image_path)?;
-        let total_size = file.metadata()?.len();
+        let file = File::open(image_path).map_err(|e| AllyError::Io {
+            code: ErrorCode::FileNotFound,
+            source: e,
+            context: format!("Opening raw disk image {}", image_path.display()),
+        })?;
+        let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut reader = BufReader::new(file);
 
         let partitions = find_partitions(&mut reader, total_size);
@@ -218,9 +232,17 @@ pub fn parse_forensic_image(
                         combined_timeline.extend(timeline);
                     }
                     reader = Arc::try_unwrap(reader_arc)
-                        .map_err(|_| "Arc unwrap failed")?
+                        .map_err(|_| AllyError::Image {
+                            code: ErrorCode::ImageReadFailed,
+                            path: image_path.display().to_string(),
+                            message: "Failed unfreezing Arc reader for raw image".to_string(),
+                        })?
                         .into_inner()
-                        .map_err(|_| "Mutex into_inner failed")?;
+                        .map_err(|_| AllyError::Image {
+                            code: ErrorCode::ImageReadFailed,
+                            path: image_path.display().to_string(),
+                            message: "Mutex poisoned on raw image reader".to_string(),
+                        })?;
                 }
                 PartitionType::Unknown => {}
             }
@@ -234,8 +256,12 @@ fn extract_and_parse_ntfs<R: Read + Seek>(
     reader: &mut R,
     mft_options: &MftParseOptions,
     temp_dir: &Path,
-) -> Result<(Vec<TimelineEntry>, ResidentStats), Box<dyn std::error::Error + Send + Sync>> {
-    let ntfs = Ntfs::new(reader)?;
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    let ntfs = Ntfs::new(reader).map_err(|e| AllyError::Mft {
+        code: ErrorCode::MftInitFailed,
+        entry: None,
+        message: format!("Failed reading NTFS volume: {}", e),
+    })?;
     let mut combined_timeline = Vec::new();
     let mut resident_stats = ResidentStats::default();
 
@@ -247,8 +273,16 @@ fn extract_and_parse_ntfs<R: Read + Seek>(
                     let mut mft_attached = attr_val.attach(reader);
                     let mft_temp_path = temp_dir.join(format!("mft_dump_{}.bin", uuid_or_random()));
                     {
-                        let mut out_file = File::create(&mft_temp_path)?;
-                        io::copy(&mut mft_attached, &mut out_file)?;
+                        let mut out_file = File::create(&mft_temp_path).map_err(|e| AllyError::Io {
+                            code: ErrorCode::IoError,
+                            source: e,
+                            context: format!("Creating temp file {}", mft_temp_path.display()),
+                        })?;
+                        io::copy(&mut mft_attached, &mut out_file).map_err(|e| AllyError::Io {
+                            code: ErrorCode::IoError,
+                            source: e,
+                            context: "Dumping $MFT stream from NTFS partition".to_string(),
+                        })?;
                     }
 
                     if let Ok((timeline, stats)) = crate::parsers::mft::parse_mft_file(&mft_temp_path, mft_options) {

@@ -1,4 +1,5 @@
 mod cli;
+mod error;
 mod ingest;
 mod parsers;
 mod timefmt;
@@ -14,12 +15,13 @@ use timeline::TimelineWriter;
 
 fn print_banner() {
     println!(r#"
-    ___    __    __    __  __ ___  ___   ______ _____ 
-   /   |  / /   / /    \ \/ //   |/   | / ____// __  \
-  / /| | / /   / /      \  // /| / /| |/ /    / __  < 
- / ___ |/ /___/ /___    / // ___/ ___ / /___ / /_/  / 
-/_/  |_/_____/_____/   /_//_/  /_/  |_\____//_____/  
-    Lateral MACB Filesystem Timeline Generator (Pure Rust)
+    _    _     _ __   __   __  __    _    ____ ____  
+   / \  | |   | |\ \ / /  |  \/  |  / \  / ___| __ ) 
+  / _ \ | |   | | \ V /   | |\/| | / _ \| |   |  _ \ 
+ / ___ \| |___| |__| |    | |  | |/ ___ \ |___| |_) |
+/_/   \_\_____|_____|_|    |_|  |_/_/   \_\____|____/ 
+       ⚖️  Ally MACB — The DFIR Courtroom Attorney ⚖️
+    "Objection! The timeline proves file timestomping."
     "#);
 }
 

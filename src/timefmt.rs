@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use crate::error::{AllyError, ErrorCode};
 
 /// Windows ticks (100-nanosecond units) per second.
 const WINDOWS_TICK_100NS: i64 = 10_000_000;
@@ -20,6 +21,18 @@ pub fn format_unix_timestamp(secs: i64, nsecs: u32) -> Option<String> {
     DateTime::from_timestamp(secs, nsecs).map(format_utc_iso)
 }
 
+/// Checked version of format_unix_timestamp returning AllyError on out of range.
+#[allow(dead_code)]
+pub fn format_unix_timestamp_checked(secs: i64, nsecs: u32) -> Result<String, AllyError> {
+    DateTime::from_timestamp(secs, nsecs)
+        .map(format_utc_iso)
+        .ok_or_else(|| AllyError::Timestamp {
+            code: ErrorCode::TimestampOutOfRange,
+            raw_value: secs,
+            message: format!("Unix timestamp {}s + {}ns is out of supported range", secs, nsecs),
+        })
+}
+
 /// Converts a 64-bit Windows FILETIME (100-nanosecond intervals since 1601-01-01 UTC)
 /// into a `DateTime<Utc>`.
 pub fn filetime_to_datetime(filetime: u64) -> Option<DateTime<Utc>> {
@@ -30,9 +43,19 @@ pub fn filetime_to_datetime(filetime: u64) -> Option<DateTime<Utc>> {
     let secs_since_1601 = ticks / WINDOWS_TICK_100NS;
     let subsec_ticks = (ticks % WINDOWS_TICK_100NS) as u32;
     let nsecs = subsec_ticks * 100;
-    let unix_secs = secs_since_1601 - SECS_BETWEEN_1601_AND_1970;
+    let unix_secs = secs_since_1601.checked_sub(SECS_BETWEEN_1601_AND_1970)?;
 
     DateTime::from_timestamp(unix_secs, nsecs)
+}
+
+/// Checked version of filetime_to_datetime returning AllyError on invalid ticks.
+#[allow(dead_code)]
+pub fn filetime_to_datetime_checked(filetime: u64) -> Result<DateTime<Utc>, AllyError> {
+    filetime_to_datetime(filetime).ok_or_else(|| AllyError::Timestamp {
+        code: ErrorCode::FiletimeInvalid,
+        raw_value: filetime as i64,
+        message: format!("Windows FILETIME ticks {} are invalid or represent year < 1601", filetime),
+    })
 }
 
 /// Converts a 64-bit Windows FILETIME to the standard UTC ISO 8601 string.
@@ -63,5 +86,16 @@ mod tests {
         let ft: u64 = (1707050100 + SECS_BETWEEN_1601_AND_1970) as u64 * 10_000_000;
         let iso = filetime_to_utc_iso(ft);
         assert_eq!(iso, Some("2024-02-04T12:35:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_filetime_zero_returns_none() {
+        assert_eq!(filetime_to_datetime(0), None);
+    }
+
+    #[test]
+    fn test_format_unix_timestamp_checked_err() {
+        let err = format_unix_timestamp_checked(i64::MAX, 0).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TimestampOutOfRange);
     }
 }

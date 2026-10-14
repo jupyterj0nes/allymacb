@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use crate::error::{AllyError, ErrorCode, Result};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub timestamp: String,
@@ -78,7 +80,7 @@ impl TimelineWriter {
     pub fn write_entries(
         entries: &mut [TimelineEntry],
         output_path: Option<&Path>,
-    ) -> io::Result<usize> {
+    ) -> Result<usize> {
         // Sort chronologically by (secs, nanos, path)
         entries.sort_by(|a, b| {
             a.timestamp_secs
@@ -94,13 +96,20 @@ impl TimelineWriter {
                         let _ = std::fs::create_dir_all(parent);
                     }
                 }
-                Box::new(BufWriter::new(File::create(path)?))
+                let file = File::create(path).map_err(|e| AllyError::Csv {
+                    code: ErrorCode::CsvExportFailed,
+                    message: format!("Failed creating CSV file '{}': {}", path.display(), e),
+                })?;
+                Box::new(BufWriter::new(file))
             }
             None => Box::new(BufWriter::new(io::stdout())),
         };
 
         // Header matching mftmactime format
-        writeln!(writer, "Date,Size,Type,Mode,UID,GID,Meta,File Name")?;
+        writeln!(writer, "Date,Size,Type,Mode,UID,GID,Meta,File Name").map_err(|e| AllyError::Csv {
+            code: ErrorCode::CsvExportFailed,
+            message: format!("Failed writing CSV header: {}", e),
+        })?;
 
         for entry in entries.iter() {
             writeln!(
@@ -114,10 +123,17 @@ impl TimelineWriter {
                 entry.gid,
                 entry.meta,
                 escape_csv(&entry.file_name)
-            )?;
+            ).map_err(|e| AllyError::Csv {
+                code: ErrorCode::CsvExportFailed,
+                message: format!("Failed writing CSV row for '{}': {}", entry.file_name, e),
+            })?;
         }
 
-        writer.flush()?;
+        writer.flush().map_err(|e| AllyError::Csv {
+            code: ErrorCode::CsvExportFailed,
+            message: format!("Failed flushing CSV buffer: {}", e),
+        })?;
+
         Ok(entries.len())
     }
 }
