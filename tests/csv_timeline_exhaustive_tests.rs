@@ -1,4 +1,4 @@
-use allymacb::timeline::{escape_csv, TimelineEntry, TimelineWriter};
+use allymacb::timeline::{escape_csv, TimelineEntry, TimelineWriter, CSV_HEADER};
 
 #[test]
 fn test_escape_plain_text() {
@@ -65,7 +65,9 @@ fn test_timeline_writer_sorting_strict_chronological() {
     let lines: Vec<&str> = content.lines().collect();
 
     // Check header
-    assert_eq!(lines[0], "Date,Size,Type,Mode,UID,GID,Meta,File Name");
+    // Literal on purpose: this pins the documented header (README) independently of the constant.
+    assert_eq!(lines[0], "time_created,size,type,mode,uid,gid,meta,file_name");
+    assert_eq!(lines[0], CSV_HEADER);
 
     // Line 1 should be file_01 (timestamp 1704067201)
     assert!(lines[1].starts_with("2024-01-01T00:00:01Z"));

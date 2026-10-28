@@ -38,6 +38,7 @@ pub enum ErrorCode {
     // Bodyfile (E7xxx)
     BodyfileInvalidFieldCount = 7001,
     BodyfileTimestampInvalid = 7002,
+    BodyfileNumericFieldInvalid = 7003,
 
     // Timestamps (E8xxx)
     TimestampOutOfRange = 8001,
@@ -45,6 +46,10 @@ pub enum ErrorCode {
 
     // Export & Formatting (E9xxx)
     CsvExportFailed = 9001,
+
+    // Evidence ingestion (E10xxx)
+    EvidenceUnrecognized = 10001,
+    EvidenceNothingParsed = 10002,
 }
 
 impl ErrorCode {
@@ -71,9 +76,12 @@ impl ErrorCode {
             ErrorCode::ImageUnsupportedFormat => "ERR_IMAGE_UNSUPPORTED_6003",
             ErrorCode::BodyfileInvalidFieldCount => "ERR_BODYFILE_FIELDS_7001",
             ErrorCode::BodyfileTimestampInvalid => "ERR_BODYFILE_TIMESTAMP_7002",
+            ErrorCode::BodyfileNumericFieldInvalid => "ERR_BODYFILE_NUMERIC_7003",
             ErrorCode::TimestampOutOfRange => "ERR_TIMESTAMP_RANGE_8001",
             ErrorCode::FiletimeInvalid => "ERR_FILETIME_INVALID_8002",
             ErrorCode::CsvExportFailed => "ERR_CSV_EXPORT_9001",
+            ErrorCode::EvidenceUnrecognized => "ERR_EVIDENCE_UNRECOGNIZED_10001",
+            ErrorCode::EvidenceNothingParsed => "ERR_EVIDENCE_NOTHING_PARSED_10002",
         }
     }
 }
@@ -131,6 +139,11 @@ pub enum AllyError {
         code: ErrorCode,
         message: String,
     },
+    Evidence {
+        code: ErrorCode,
+        path: String,
+        message: String,
+    },
 }
 
 impl AllyError {
@@ -146,6 +159,22 @@ impl AllyError {
             AllyError::Bodyfile { code, .. } => *code,
             AllyError::Timestamp { code, .. } => *code,
             AllyError::Csv { code, .. } => *code,
+            AllyError::Evidence { code, .. } => *code,
+        }
+    }
+
+    /// Builds an I/O error with a path-bearing context, mapping the
+    /// `ErrorKind` to the matching forensic code.
+    pub fn io_with_context(err: std::io::Error, context: impl Into<String>) -> Self {
+        let code = match err.kind() {
+            std::io::ErrorKind::NotFound => ErrorCode::FileNotFound,
+            std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+            _ => ErrorCode::IoError,
+        };
+        AllyError::Io {
+            code,
+            source: err,
+            context: context.into(),
         }
     }
 }
@@ -184,24 +213,25 @@ impl fmt::Display for AllyError {
             AllyError::Csv { code, message } => {
                 write!(f, "[{}] CSV Timeline: {}", code, message)
             }
+            AllyError::Evidence { code, path, message } => {
+                write!(f, "[{}] Evidence '{}': {}", code, path, message)
+            }
         }
     }
 }
 
-impl std::error::Error for AllyError {}
+impl std::error::Error for AllyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AllyError::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for AllyError {
     fn from(err: std::io::Error) -> Self {
-        let code = match err.kind() {
-            std::io::ErrorKind::NotFound => ErrorCode::FileNotFound,
-            std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
-            _ => ErrorCode::IoError,
-        };
-        AllyError::Io {
-            code,
-            source: err,
-            context: "Standard filesystem I/O".to_string(),
-        }
+        AllyError::io_with_context(err, "Standard filesystem I/O")
     }
 }
 

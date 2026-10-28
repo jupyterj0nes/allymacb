@@ -5,11 +5,11 @@ use clap::Parser;
 #[command(
     name = "allymacb",
     author = "DFIR Rust Team",
-    version = "1.0.0",
-    about = "Pure Rust MFT, USN, and Linux Filesystem MACB Timeline Generator\nSupports Forensic Images (E01, RAW, DD, VMDK, VHD), Archives (ZIP, TAR.GZ), Triages & Loose Files"
+    version,
+    about = "Pure Rust MFT, USN, and Linux Filesystem MACB Timeline Generator\nSupports Forensic Images (E01, RAW, DD, split RAW, fixed VHD), Archives (ZIP, TAR, TAR.GZ), Triages & Loose Files"
 )]
 pub struct Cli {
-    /// Input file(s): $MFT, forensic disk image (E01, DD, RAW), archive (ZIP, TAR.GZ), etc.
+    /// Input file(s): $MFT, $UsnJrnl:$J, bodyfile, forensic disk image (E01, DD, RAW), archive (ZIP, TAR.GZ), etc.
     #[arg(short = 'f', long = "file", num_args = 0..)]
     pub files: Vec<PathBuf>,
 
@@ -21,7 +21,7 @@ pub struct Cli {
     #[arg(short = 'u', long = "usn")]
     pub usn: Option<PathBuf>,
 
-    /// Output CSV timeline file (prints to stdout if omitted)
+    /// Output CSV timeline file (prints to stdout if omitted; all status messages go to stderr)
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
@@ -41,7 +41,7 @@ pub struct Cli {
     #[arg(long = "resident-report")]
     pub resident_report: Option<PathBuf>,
 
-    /// Suppress progress bars and banner
+    /// Suppress progress bars, banner and informational messages (warnings are still printed)
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
 }

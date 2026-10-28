@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use allymacb::parsers::bodyfile::parse_bodyfile_stream;
 use allymacb::parsers::mft::{parse_mft_reader, MftParseOptions};
-use allymacb::timeline::{TimelineEntry, TimelineWriter};
+use allymacb::timeline::{TimelineEntry, TimelineWriter, CSV_HEADER};
 
 #[test]
 fn test_mft_parsing_real_sample() {
@@ -110,7 +110,7 @@ fn test_csv_timeline_writer_sorting_and_escaping() {
     let content = std::fs::read_to_string(&temp_out).unwrap();
     let lines: Vec<&str> = content.lines().collect();
 
-    assert_eq!(lines[0], "Date,Size,Type,Mode,UID,GID,Meta,File Name");
+    assert_eq!(lines[0], CSV_HEADER);
     // Line 1 should be the older file (2020)
     assert!(lines[1].starts_with("2020-01-01T00:00:00Z,100,m..."));
     // Line 2 should be the newer file (2026) and properly escaped with quotes

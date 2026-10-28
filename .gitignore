@@ -4,3 +4,5 @@
 *.tar.gz
 *.bin
 *.log
+__pycache__/
+*.pyc

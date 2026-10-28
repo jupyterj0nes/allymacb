@@ -51,48 +51,53 @@ test_drive_letters! {
     test_drive_low_d: 'd',
 }
 
-// Path sanitization tests for resident file extraction (30 tests)
+// Path sanitization tests for resident file extraction: the real sanitizer
+// must keep ordinary NTFS paths and refuse anything that could leave the
+// extraction directory.
+use allymacb::parsers::mft::sanitize_relative_path;
+
 macro_rules! test_path_sanitizer {
     ($($fn_name:ident: $input:expr => $expected:expr),* $(,)?) => {
         $(
             #[test]
             fn $fn_name() {
-                let clean = $input
-                    .replace(":\\", "/")
-                    .replace(":/", "/")
-                    .replace('\\', "/")
-                    .replace(':', "_");
-                let safe_rel = clean.trim_start_matches('/');
-                assert_eq!(safe_rel, $expected);
+                let got = sanitize_relative_path($input);
+                let want: Option<PathBuf> = $expected.map(|s: &str| s.split('/').collect::<PathBuf>());
+                assert_eq!(got, want);
             }
         )*
     };
 }
 
 test_path_sanitizer! {
-    test_clean_p1: "C:\\Windows\\System32\\cmd.exe" => "C/Windows/System32/cmd.exe",
-    test_clean_p2: "C:\\Users\\admin\\file.txt" => "C/Users/admin/file.txt",
-    test_clean_p3: "C:\\file.txt:Zone.Identifier" => "C/file.txt_Zone.Identifier",
-    test_clean_p4: "D:\\backup\\dump.tar.gz" => "D/backup/dump.tar.gz",
-    test_clean_p5: "E:/path/forward/slash" => "E/path/forward/slash",
-    test_clean_p6: "\\\\server\\share\\file" => "server/share/file",
-    test_clean_p7: "C:\\Program Files (x86)\\test" => "C/Program Files (x86)/test",
-    test_clean_p8: "C:\\[UNKNOWN]\\entry_123" => "C/[UNKNOWN]/entry_123",
-    test_clean_p9: "C:\\file:ads1:ads2" => "C/file_ads1_ads2",
-    test_clean_p10: "C:\\Windows\\$MFT" => "C/Windows/$MFT",
-    test_clean_p11: "C:\\Windows\\$LogFile" => "C/Windows/$LogFile",
-    test_clean_p12: "C:\\$Extend\\$UsnJrnl" => "C/$Extend/$UsnJrnl",
-    test_clean_p13: "C:\\pagefile.sys" => "C/pagefile.sys",
-    test_clean_p14: "C:\\hiberfil.sys" => "C/hiberfil.sys",
-    test_clean_p15: "C:\\swapfile.sys" => "C/swapfile.sys",
-    test_clean_p16: "C:\\Recovery\\Winre.wim" => "C/Recovery/Winre.wim",
-    test_clean_p17: "C:\\System Volume Information\\Syscache.hve" => "C/System Volume Information/Syscache.hve",
-    test_clean_p18: "C:\\Windows\\System32\\config\\SYSTEM" => "C/Windows/System32/config/SYSTEM",
-    test_clean_p19: "C:\\Windows\\System32\\config\\SAM" => "C/Windows/System32/config/SAM",
-    test_clean_p20: "C:\\Windows\\System32\\config\\SECURITY" => "C/Windows/System32/config/SECURITY",
-    test_clean_p21: "C:\\Windows\\System32\\config\\SOFTWARE" => "C/Windows/System32/config/SOFTWARE",
-    test_clean_p22: "C:\\Windows\\System32\\winevt\\Logs\\Security.evtx" => "C/Windows/System32/winevt/Logs/Security.evtx",
-    test_clean_p23: "C:\\Windows\\System32\\winevt\\Logs\\System.evtx" => "C/Windows/System32/winevt/Logs/System.evtx",
-    test_clean_p24: "C:\\Windows\\System32\\drivers\\etc\\hosts" => "C/Windows/System32/drivers/etc/hosts",
-    test_clean_p25: "C:\\Users\\Default\\NTUSER.DAT" => "C/Users/Default/NTUSER.DAT",
+    test_clean_p1: "C:\\Windows\\System32\\cmd.exe" => Some("Windows/System32/cmd.exe"),
+    test_clean_p2: "C:\\Users\\admin\\file.txt" => Some("Users/admin/file.txt"),
+    test_clean_p3: "C:\\file.txt:Zone.Identifier" => Some("file.txt_Zone.Identifier"),
+    test_clean_p4: "D:\\backup\\dump.tar.gz" => Some("backup/dump.tar.gz"),
+    test_clean_p5: "E:/path/forward/slash" => Some("path/forward/slash"),
+    test_clean_p6: "\\\\server\\share\\file" => Some("server/share/file"),
+    test_clean_p7: "C:\\Program Files (x86)\\test" => Some("Program Files (x86)/test"),
+    test_clean_p8: "C:\\[UNKNOWN]\\entry_123" => Some("[UNKNOWN]/entry_123"),
+    test_clean_p9: "C:\\file:ads1:ads2" => Some("file_ads1_ads2"),
+    test_clean_p10: "C:\\Windows\\$MFT" => Some("Windows/$MFT"),
+    test_clean_p11: "C:\\Windows\\$LogFile" => Some("Windows/$LogFile"),
+    test_clean_p12: "C:\\$Extend\\$UsnJrnl" => Some("$Extend/$UsnJrnl"),
+    test_clean_p13: "C:\\pagefile.sys" => Some("pagefile.sys"),
+    test_clean_p14: "C:\\hiberfil.sys" => Some("hiberfil.sys"),
+    test_clean_p15: "C:\\swapfile.sys" => Some("swapfile.sys"),
+    test_clean_p16: "C:\\Recovery\\Winre.wim" => Some("Recovery/Winre.wim"),
+    test_clean_p17: "C:\\System Volume Information\\Syscache.hve" => Some("System Volume Information/Syscache.hve"),
+    test_clean_p18: "C:\\Windows\\System32\\config\\SYSTEM" => Some("Windows/System32/config/SYSTEM"),
+    test_clean_p19: "C:\\Windows\\System32\\config\\SAM" => Some("Windows/System32/config/SAM"),
+    test_clean_p20: "C:\\Windows\\System32\\config\\SECURITY" => Some("Windows/System32/config/SECURITY"),
+    test_clean_p21: "C:\\Windows\\System32\\config\\SOFTWARE" => Some("Windows/System32/config/SOFTWARE"),
+    test_clean_p22: "C:\\Windows\\System32\\winevt\\Logs\\Security.evtx" => Some("Windows/System32/winevt/Logs/Security.evtx"),
+    test_clean_p23: "C:\\Windows\\System32\\winevt\\Logs\\System.evtx" => Some("Windows/System32/winevt/Logs/System.evtx"),
+    test_clean_p24: "C:\\Windows\\System32\\drivers\\etc\\hosts" => Some("Windows/System32/drivers/etc/hosts"),
+    test_clean_p25: "C:\\Users\\Default\\NTUSER.DAT" => Some("Users/Default/NTUSER.DAT"),
+    test_unsafe_p1: "C:\\..\\..\\pwn.txt" => None,
+    test_unsafe_p2: "C:\\Users\\..\\..\\..\\Windows\\win.ini" => None,
+    test_unsafe_p3: "C:\\[UNKNOWN]\\../../x" => None,
+    test_unsafe_p4: "C:\\\\" => None,
+    test_unsafe_p5: "C:\\..\\\\" => None,
 }

@@ -1,31 +1,33 @@
-mod cli;
-mod error;
-mod ingest;
-mod parsers;
-mod timefmt;
-mod timeline;
-
+use std::process::ExitCode;
 use std::time::Instant;
 use clap::Parser;
 
-use cli::Cli;
-use ingest::process_evidence_inputs;
-use parsers::mft::MftParseOptions;
-use timeline::TimelineWriter;
+use allymacb::cli::Cli;
+use allymacb::ingest::process_evidence_inputs;
+use allymacb::parsers::mft::MftParseOptions;
+use allymacb::timeline::TimelineWriter;
+
+/// Exit codes, documented in the README:
+/// 0 = every evidence source parsed, 1 = usage error, 2 = nothing could be
+/// parsed (no CSV written), 3 = CSV written but at least one source failed.
+const EXIT_USAGE: u8 = 1;
+const EXIT_NOTHING_PARSED: u8 = 2;
+const EXIT_PARTIAL: u8 = 3;
 
 fn print_banner() {
-    println!(r#"
-    _    _     _ __   __   __  __    _    ____ ____  
-   / \  | |   | |\ \ / /  |  \/  |  / \  / ___| __ ) 
-  / _ \ | |   | | \ V /   | |\/| | / _ \| |   |  _ \ 
+    // Everything informational goes to stderr so the CSV on stdout stays clean.
+    eprintln!(r#"
+    _    _     _ __   __   __  __    _    ____ ____
+   / \  | |   | |\ \ / /  |  \/  |  / \  / ___| __ )
+  / _ \ | |   | | \ V /   | |\/| | / _ \| |   |  _ \
  / ___ \| |___| |__| |    | |  | |/ ___ \ |___| |_) |
-/_/   \_\_____|_____|_|    |_|  |_/_/   \_\____|____/ 
+/_/   \_\_____|_____|_|    |_|  |_/_/   \_\____|____/
        ⚖️  Ally MACB — The DFIR Courtroom Attorney ⚖️
     "Objection! The timeline proves file timestomping."
     "#);
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> ExitCode {
     let args = Cli::parse();
     let start_time = Instant::now();
 
@@ -36,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.files.is_empty() && args.directories.is_empty() && args.usn.is_none() {
         eprintln!("[!] No input evidence provided. Use -f, -d, or -u.");
         eprintln!("    Run with --help for usage details.");
-        std::process::exit(1);
+        return ExitCode::from(EXIT_USAGE);
     }
 
     let mft_options = MftParseOptions {
@@ -48,41 +50,77 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     if !args.quiet {
-        println!("[*] Starting evidence ingestion...");
+        eprintln!("[*] Starting evidence ingestion...");
     }
 
-    let (mut timeline, resident_stats) = process_evidence_inputs(
+    let mut report = match process_evidence_inputs(
         &args.files,
         &args.directories,
         args.usn.as_ref(),
         &mft_options,
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[!] Fatal: {}", e);
+            return ExitCode::from(EXIT_NOTHING_PARSED);
+        }
+    };
+
+    if report.sources_ok == 0 {
+        eprintln!(
+            "[!] No evidence could be parsed ({} source(s) failed). No timeline written.",
+            report.sources_failed
+        );
+        return ExitCode::from(EXIT_NOTHING_PARSED);
+    }
 
     if !args.quiet {
-        println!(
+        eprintln!(
             "[*] Sorting and writing {} timeline entries (UTC ISO 8601)...",
-            timeline.len()
+            report.timeline.len()
         );
     }
 
-    let count = TimelineWriter::write_entries(&mut timeline, args.output.as_deref())?;
+    let count = match TimelineWriter::write_entries(&mut report.timeline, args.output.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[!] Fatal: {}", e);
+            return ExitCode::from(EXIT_NOTHING_PARSED);
+        }
+    };
 
     if !args.quiet {
-        println!();
-        println!("==================== Summary ====================");
-        println!("  Timeline entries written : {}", count);
+        eprintln!();
+        eprintln!("==================== Summary ====================");
+        eprintln!("  Timeline entries written : {}", count);
+        eprintln!("  Evidence sources parsed  : {}", report.sources_ok);
+        eprintln!("  Evidence sources failed  : {}", report.sources_failed);
         if let Some(ref out) = args.output {
-            println!("  Output destination       : {}", out.display());
+            eprintln!("  Output destination       : {}", out.display());
         } else {
-            println!("  Output destination       : stdout");
+            eprintln!("  Output destination       : stdout");
         }
         if args.resident.is_some() {
-            println!("  Resident files dumped    : {}", resident_stats.total_extracted);
-            println!("  Resident total bytes     : {} bytes", resident_stats.total_bytes);
+            eprintln!("  Resident files dumped    : {}", report.resident_stats.total_extracted);
+            eprintln!("  Resident total bytes     : {} bytes", report.resident_stats.total_bytes);
+            if report.resident_stats.total_failed > 0 || report.resident_stats.total_unsafe_paths > 0 {
+                eprintln!(
+                    "  Resident dump problems   : {} failed, {} unsafe paths refused",
+                    report.resident_stats.total_failed, report.resident_stats.total_unsafe_paths
+                );
+            }
         }
-        println!("  Elapsed time             : {:.2?}", start_time.elapsed());
-        println!("=================================================");
+        eprintln!("  Elapsed time             : {:.2?}", start_time.elapsed());
+        eprintln!("=================================================");
     }
 
-    Ok(())
+    if report.sources_failed > 0 {
+        eprintln!(
+            "[!] Timeline is PARTIAL: {} evidence source(s) failed (see warnings above).",
+            report.sources_failed
+        );
+        return ExitCode::from(EXIT_PARTIAL);
+    }
+
+    ExitCode::SUCCESS
 }
