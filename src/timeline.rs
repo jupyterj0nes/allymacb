@@ -106,7 +106,7 @@ impl TimelineWriter {
         };
 
         // Header matching mftmactime format
-        writeln!(writer, "Date,Size,Type,Mode,UID,GID,Meta,File Name").map_err(|e| AllyError::Csv {
+        writeln!(writer, "time_created,size,type,mode,uid,gid,meta,file_name").map_err(|e| AllyError::Csv {
             code: ErrorCode::CsvExportFailed,
             message: format!("Failed writing CSV header: {}", e),
         })?;
