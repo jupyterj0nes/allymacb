@@ -1,4 +1,6 @@
 pub mod archive;
+pub mod carve;
+pub mod carve_text;
 pub mod image;
 pub mod triage;
 
@@ -291,9 +293,23 @@ pub fn process_evidence_inputs(
                         Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
                     }
                 }
+                Ok(Sniffed::Unknown) if mft_options.carve => {
+                    info(quiet, format!("[*] Unrecognized file, carving it for NTFS records: {}", file_path.display()));
+                    match carve::carve_blob(file_path, mft_options) {
+                        Ok((entries, stats)) => {
+                            info(quiet, format!("    [+] Carving: {}", carve::describe_stats(&stats)));
+                            if entries.is_empty() {
+                                report.fail(format!("{}: carving found no NTFS FILE records or $I30 entries", file_path.display()));
+                            } else {
+                                report.ok(entries, ResidentStats::default());
+                            }
+                        }
+                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                    }
+                }
                 Ok(Sniffed::Unknown) => {
                     report.warn(format!(
-                        "{}: unrecognized evidence type; timelining the host filesystem metadata of this file only",
+                        "{}: unrecognized evidence type; timelining the host filesystem metadata of this file only (use --carve to scan it for NTFS records)",
                         file_path.display()
                     ));
                     match walk_directory_timeline(file_path) {

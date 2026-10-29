@@ -24,6 +24,7 @@ fn test_mft_parsing_real_sample() {
             resident_report: None,
             drive_letter: Some('C'),
             quiet: true,
+            carve: false,
         };
 
         let (timeline, resident_stats) = parse_mft_reader(reader, &options).expect("Failed to parse MFT");

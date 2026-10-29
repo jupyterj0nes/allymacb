@@ -13,6 +13,7 @@ macro_rules! test_drive_letters {
                     resident_report: Some(PathBuf::from("report.txt")),
                     drive_letter: Some($drive),
                     quiet: true,
+                    carve: false,
                 };
                 assert_eq!(opts.drive_letter, Some($drive));
                 assert!(opts.include_file_name_timestamps);

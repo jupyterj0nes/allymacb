@@ -6,7 +6,8 @@ use ext4_view::{Ext4, Ext4Read, FileType, PathBuf as Ext4PathBuf};
 
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::format_unix_timestamp;
-use crate::timeline::{join_macb_flags, TimelineEntry};
+use crate::anomaly;
+use crate::timeline::{join_macb_flags, source, TimelineEntry};
 
 /// Maximum directory nesting followed before a subtree is abandoned. Protects
 /// against crafted images whose directory entries point back at an ancestor
@@ -232,6 +233,14 @@ pub fn parse_ext4_partition_with_report<R: Read + Seek + Send + 'static>(
                     *current = join_macb_flags(current, 'b');
                 }
 
+                let flags = anomaly::column(
+                    &[
+                        anomaly::unix_flags(Some(m_ts.seconds()), None, meta.created().map(|c| c.seconds()), anomaly::now_secs()),
+                        anomaly::name_flags(&display_path),
+                    ]
+                    .concat(),
+                );
+
                 for ((secs, nanos), macb) in ts_map {
                     // 0 means "never set" on ext4; negative values are real
                     // (pre-1970) and are a timestomping indicator, so keep them.
@@ -250,7 +259,7 @@ pub fn parse_ext4_partition_with_report<R: Read + Seek + Send + 'static>(
                             gid,
                             "0".to_string(),
                             display_path.clone(),
-                        ));
+                        ).with_source(source::EXT4).with_flags(flags.clone()));
                     }
                 }
                 report.entries_ok += 1;

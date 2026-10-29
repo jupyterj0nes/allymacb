@@ -66,7 +66,7 @@ fn test_timeline_writer_sorting_strict_chronological() {
 
     // Check header
     // Literal on purpose: this pins the documented header (README) independently of the constant.
-    assert_eq!(lines[0], "time_created,size,type,mode,uid,gid,meta,file_name");
+    assert_eq!(lines[0], "time_created,size,type,mode,uid,gid,meta,file_name,source,flags");
     assert_eq!(lines[0], CSV_HEADER);
 
     // Line 1 should be file_01 (timestamp 1704067201)

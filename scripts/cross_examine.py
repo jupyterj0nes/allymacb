@@ -39,9 +39,9 @@ def run(args, name, extra=()):
         with open(out, encoding='utf-8', newline='') as f:
             r = csv.reader(f)
             header = next(r, None)
-            assert header == ['time_created', 'size', 'type', 'mode', 'uid', 'gid', 'meta', 'file_name'], header
+            assert header == ['time_created', 'size', 'type', 'mode', 'uid', 'gid', 'meta', 'file_name', 'source', 'flags'], header
             for row in r:
-                if len(row) != 8:
+                if len(row) != 10 or row[8] not in ('mft', 'usn', 'bodyfile', 'ext4', 'fs', 'carved'):
                     bad += 1
                     continue
                 try:
@@ -407,6 +407,104 @@ if os.path.isdir(W):
             except OSError:
                 pass
     rc, rows, err = run(['-d', lt], 'linux_tree_walk')
+
+say('== carving (--carve) ==')
+# Volumes whose live $MFT is intact: nothing in them may be reported as a new
+# FILE record, and no carved row may duplicate a live row.
+CARVE_SUFFIX = re.compile(r' \(carved @0x[0-9A-F]+\)$')
+def carve_check(name, args):
+    rc, rows, err = run([*args], name, extra=['--carve'])
+    live = {(r[0], r[2], r[6], r[7]) for r in rows if r[8] != 'carved'}
+    carved = [r for r in rows if r[8] == 'carved']
+    dup = sum(1 for r in carved if (r[0], r[2], r[6], CARVE_SUFFIX.sub('', r[7])) in live)
+    say(f'    {name}: {len(rows) - len(carved)} live rows, {len(carved)} carved rows, {dup} carved rows duplicating a live row')
+    return rows
+for nm in ['ntfs3.raw', 'ntfs_index.raw', 'ntfs_frag_mft.raw', 'ntfs3_attrlist.raw']:
+    carve_check('carve_' + nm, ['-n', '-f', os.path.join(R, nm)])
+carve_check('carve_e01_gen2', ['-n', '-f', os.path.join(E, 'ntfs1-gen2.E01')])
+
+# Every record of the NIST $MFT scattered at random sector offsets in junk:
+# carving the blob must give back the live timeline (minus what only an
+# $ATTRIBUTE_LIST can supply).
+import random
+mft = open(os.path.join(D, 'nist-hacking-case.mft'), 'rb').read()
+recs = [mft[i:i + 1024] for i in range(0, len(mft), 1024)]
+recs = [r for r in recs if r[:4] == b'FILE']
+random.seed(7)
+random.shuffle(recs)
+blob = bytearray(os.urandom(max(32 << 20, len(recs) * 3072)))
+slots = list(range(0, len(blob) - 1024, 512))
+random.shuffle(slots)
+used = set()
+for r in recs:
+    while True:
+        off = slots.pop()
+        if all(abs(off - u) >= 1024 for u in used):
+            break
+    used.add(off)
+    blob[off:off + 1024] = r
+bp = os.path.join(OUT, 'nist_scattered.bin')
+open(bp, 'wb').write(blob)
+rc, live_rows, _ = run(['-n', '-f', os.path.join(D, 'nist-hacking-case.mft')], 'carve_nist_live')
+rc, blob_rows, err = run(['-n', '-f', bp], 'carve_nist_blob', extra=['--carve'])
+from collections import Counter
+def key(r, carved):
+    return (r[0], r[2], r[6], CARVE_SUFFIX.sub('', r[7]) if carved else r[7], r[1])
+L = Counter(key(r, False) for r in live_rows)
+C = Counter(key(r, True) for r in blob_rows if r[8] == 'carved')
+exact = sum((L & C).values())
+rl, rc_ = L - C, C - L
+L2 = Counter(k[:4] for k in rl.elements()); C2 = Counter(k[:4] for k in rc_.elements())
+size_only = sum((L2 & C2).values())
+def base(n): return n.split(' (')[0].rsplit(chr(92), 1)[-1]
+L3 = Counter((k[0], k[1], k[2], base(k[3])) for k in (L2 - C2).elements()); C3 = Counter((k[0], k[1], k[2], base(k[3])) for k in (C2 - L2).elements())
+parent_only = sum((L3 & C3).values())
+say(f'    NIST $MFT scattered in {len(blob) >> 20} MiB of junk: {len(recs)} records placed; live {len(live_rows)} rows, carved {sum(C.values())} rows')
+say(f'      identical {exact}, size differs {size_only} ($DATA in an extension record), parent name differs {parent_only} (long name in an extension record), only live {sum((L3 - C3).values())}, only carved {sum((C3 - L3).values())}')
+
+# Ground truth from a real NTFS volume: scripts/carve_lab.ps1 run on a Windows
+# host, outputs copied to <samples>/lab/.
+LAB = os.path.join(SAMPLES, 'lab')
+if os.path.isdir(LAB):
+    say('== carving lab (scripts/carve_lab.ps1 and carve_lab_cases.ps1 on a Windows host) ==')
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from check_carve_lab import check as lab_check
+    for case in sorted(os.listdir(LAB)):
+        cdir = os.path.join(LAB, case)
+        truth = os.path.join(cdir, 'truth.json')
+        if not os.path.exists(truth):
+            continue
+        for nm in ['deleted', 'reformat']:
+            vhd = os.path.join(cdir, nm + '.vhd')
+            if not os.path.exists(vhd):
+                continue
+            for mode, extra in [('live', []), ('carve', ['--carve'])]:
+                run(['-n', '-m', 'V', '-f', vhd], f'lab_{case}_{nm}_{mode}', extra=extra)
+                for line in lab_check(truth, os.path.join(OUT, f'lab_{case}_{nm}_{mode}.csv')):
+                    say(line)
+
+# Linux ground truth: scripts/linux_lab.sh on a Linux host, outputs in <samples>/lab_linux/.
+LL = os.path.join(SAMPLES, 'lab_linux')
+if os.path.exists(os.path.join(LL, 'truth.json')):
+    say('== Linux lab (scripts/linux_lab.sh on a Linux host) ==')
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from check_linux_lab import check as linux_check
+    inputs = [('ext4', 'ext4.img', []), ('ext4_carve', 'ext4.img', ['--carve']), ('bodyfile', 'bodyfile.txt', [])]
+    inputs += [('archive', n, []) for n in os.listdir(LL) if n.endswith('.tar.gz')]
+    for kind, name, extra in inputs:
+        run(['-f', os.path.join(LL, name)], f'linux_{kind}', extra=extra)
+        for line in linux_check(os.path.join(LL, 'truth.json'), os.path.join(OUT, f'linux_{kind}.csv'), kind.split('_')[0]):
+            say(line)
+
+# Timestamped artifacts in free space: scripts/linux_lab_logs.sh, outputs in <samples>/lab_linux_logs/.
+LG = os.path.join(SAMPLES, 'lab_linux_logs')
+if os.path.exists(os.path.join(LG, 'logs.img')):
+    say('== free-space artifacts (scripts/linux_lab_logs.sh on a Linux host) ==')
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from check_linux_logs import check as logs_check
+    run(['-f', os.path.join(LG, 'logs.img')], 'linux_logs_carve', extra=['--carve'])
+    for line in logs_check(LG, os.path.join(OUT, 'linux_logs_carve.csv')):
+        say(line)
 
 say('== failure modes ==')
 rc, rows, err = run(['-f', os.path.join(OUT, 'nope.E01')], 'missing_file')

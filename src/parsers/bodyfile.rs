@@ -3,7 +3,8 @@ use std::io::BufRead;
 
 use crate::error::{AllyError, ErrorCode};
 use crate::timefmt::format_unix_timestamp;
-use crate::timeline::{join_macb_flags, TimelineEntry};
+use crate::anomaly;
+use crate::timeline::{join_macb_flags, source, TimelineEntry};
 
 /// Number of pipe-separated fields in a TSK 3.x bodyfile line:
 /// `MD5|name|inode|mode_as_string|UID|GID|size|atime|mtime|ctime|crtime`
@@ -126,21 +127,30 @@ pub fn parse_bodyfile_line(
         }
     }
 
+    let opt = |t: i64| if t != 0 { Some(t) } else { None };
+    let flags = anomaly::column(
+        &[anomaly::unix_flags(opt(mtime), opt(ctime), opt(crtime), anomaly::now_secs()), anomaly::name_flags(raw_path)].concat(),
+    );
+
     let mut entries = Vec::new();
     for (secs, macb) in ts_map {
         if let Some(ts_iso) = format_unix_timestamp(secs, 0) {
-            entries.push(TimelineEntry::new(
-                ts_iso,
-                secs,
-                0,
-                size,
-                macb,
-                mode.to_string(),
-                uid,
-                gid,
-                inode.to_string(),
-                full_path.clone(),
-            ));
+            entries.push(
+                TimelineEntry::new(
+                    ts_iso,
+                    secs,
+                    0,
+                    size,
+                    macb,
+                    mode.to_string(),
+                    uid,
+                    gid,
+                    inode.to_string(),
+                    full_path.clone(),
+                )
+                .with_source(source::BODYFILE)
+                .with_flags(flags.clone()),
+            );
         }
     }
 

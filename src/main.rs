@@ -2,10 +2,11 @@ use std::process::ExitCode;
 use std::time::Instant;
 use clap::Parser;
 
+use allymacb::anomaly;
 use allymacb::cli::Cli;
 use allymacb::ingest::process_evidence_inputs;
 use allymacb::parsers::mft::MftParseOptions;
-use allymacb::timeline::TimelineWriter;
+use allymacb::timeline::{source, TimelineEntry, TimelineWriter};
 
 /// Exit codes, documented in the README:
 /// 0 = every evidence source parsed, 1 = usage error, 2 = nothing could be
@@ -25,6 +26,72 @@ fn print_banner() {
        ⚖️  Ally MACB — The DFIR Courtroom Attorney ⚖️
     "Objection! The timeline proves file timestomping."
     "#);
+}
+
+/// How many `[ALERT]` files are listed one by one before the rest is summed up.
+const MAX_ALERT_LINES: usize = 40;
+
+/// Prints the anti-forensics findings: every file with an ALERT on its own
+/// line (capped), then one line of counts for the WARN-level indicators.
+/// Always printed, quiet or not: an alert is not progress chatter.
+fn report_anomalies(timeline: &[TimelineEntry]) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // One entry per file: (meta, name without row tags) -> indicators.
+    let mut alerts: BTreeMap<(String, String), BTreeSet<&str>> = BTreeMap::new();
+    let mut warn_files: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
+    for e in timeline {
+        if e.flags.is_empty() {
+            continue;
+        }
+        let flags = anomaly::parse_column(&e.flags);
+        let name = base_name(&e.file_name);
+        let key = (e.meta.clone(), name);
+        match anomaly::severity(&flags) {
+            Some(anomaly::Severity::Alert) => {
+                alerts.entry(key).or_default().extend(flags);
+            }
+            Some(anomaly::Severity::Warn) => {
+                for f in flags {
+                    warn_files.entry(f).or_default().insert(key.clone());
+                }
+            }
+            None => {}
+        }
+    }
+
+    if !alerts.is_empty() {
+        eprintln!();
+        eprintln!("[ALERT] {} file(s) with anti-forensics indicators (timestomping, name tricks). flags column says ALERT:", alerts.len());
+        for ((meta, name), flags) in alerts.iter().take(MAX_ALERT_LINES) {
+            let joined: Vec<&str> = flags.iter().copied().collect();
+            eprintln!("[ALERT]   {:<34} {}  (meta {})", joined.join("+"), name, meta);
+        }
+        if alerts.len() > MAX_ALERT_LINES {
+            eprintln!("[ALERT]   ... and {} more; filter the flags column for ALERT", alerts.len() - MAX_ALERT_LINES);
+        }
+    }
+    if !warn_files.is_empty() {
+        let detail: Vec<String> = warn_files.iter().map(|(f, s)| format!("{} {}", f, s.len())).collect();
+        let total: BTreeSet<&(String, String)> = warn_files.values().flatten().collect();
+        eprintln!(
+            "[!] {} file(s) with WARN-level indicators ({}): also produced by preserved-timestamp copies and installers; filter the flags column for WARN",
+            total.len(),
+            detail.join(", ")
+        );
+    }
+}
+
+/// File name without the per-row tags, so the rows of one file collapse.
+fn base_name(file_name: &str) -> String {
+    let mut s = file_name;
+    for tag in [" ($FILE_NAME: ", " (carved @0x", " ($I30)", " (deleted)", " (USN: "] {
+        if let Some(i) = s.find(tag) {
+            s = &s[..i];
+        }
+    }
+    // An ADS row names the host file.
+    s.to_string()
 }
 
 fn main() -> ExitCode {
@@ -47,6 +114,7 @@ fn main() -> ExitCode {
         resident_report: args.resident_report.clone(),
         drive_letter: Some(args.drive),
         quiet: args.quiet,
+        carve: args.carve,
     };
 
     if !args.quiet {
@@ -81,6 +149,10 @@ fn main() -> ExitCode {
         );
     }
 
+    let carved = report.timeline.iter().filter(|e| e.source == source::CARVED).count();
+
+    report_anomalies(&report.timeline);
+
     let count = match TimelineWriter::write_entries(&mut report.timeline, args.output.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -93,6 +165,9 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("==================== Summary ====================");
         eprintln!("  Timeline entries written : {}", count);
+        if args.carve {
+            eprintln!("  Carved entries           : {}", carved);
+        }
         eprintln!("  Evidence sources parsed  : {}", report.sources_ok);
         eprintln!("  Evidence sources failed  : {}", report.sources_failed);
         if let Some(ref out) = args.output {

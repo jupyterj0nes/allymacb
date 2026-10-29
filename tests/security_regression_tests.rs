@@ -91,8 +91,8 @@ fn csv_writer_neutralises_formula_filenames_and_escapes_every_column() {
     let text = fs::read_to_string(&out).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], CSV_HEADER);
-    assert_eq!(lines[1], "2024-01-01T00:00:00Z,10,m...,-rw-r--r--,0,0,\"4230,evil\",\"'=cmd|' /C calc'!A0\"");
-    assert_eq!(lines[2], "2024-01-01T00:00:01Z,10,m...,-rw-r--r--,0,0,1,\"'@SUM(A1:A9)\"");
+    assert_eq!(lines[1], "2024-01-01T00:00:00Z,10,m...,-rw-r--r--,0,0,\"4230,evil\",\"'=cmd|' /C calc'!A0\",unknown,");
+    assert_eq!(lines[2], "2024-01-01T00:00:01Z,10,m...,-rw-r--r--,0,0,1,\"'@SUM(A1:A9)\",unknown,");
     let _ = fs::remove_dir_all(&dir);
 }
 

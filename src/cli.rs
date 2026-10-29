@@ -44,4 +44,10 @@ pub struct Cli {
     /// Suppress progress bars, banner and informational messages (warnings are still printed)
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
+
+    /// Carve NTFS FILE records and $I30 index entries from the raw sectors of disk images
+    /// and unrecognised files (old $MFT copies, VSS remnants, unallocated space).
+    /// Off by default. Recovered rows say `carved` in the source column and carry the image offset.
+    #[arg(long = "carve")]
+    pub carve: bool,
 }

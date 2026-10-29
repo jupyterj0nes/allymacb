@@ -4,6 +4,26 @@ use std::path::Path;
 
 use crate::error::{AllyError, ErrorCode, Result};
 
+/// Values of the `source` column: which kind of evidence a row was built from.
+pub mod source {
+    /// `$STANDARD_INFORMATION` / `$FILE_NAME` of a live `$MFT` record.
+    pub const MFT: &str = "mft";
+    /// `$UsnJrnl:$J` record.
+    pub const USN: &str = "usn";
+    /// TSK bodyfile line.
+    pub const BODYFILE: &str = "bodyfile";
+    /// ext4 inode read from a disk image.
+    pub const EXT4: &str = "ext4";
+    /// Metadata of a file on the analyst's own filesystem (directory walk,
+    /// extracted archive).
+    pub const FS: &str = "fs";
+    /// Recovered by `--carve` from raw sectors: an NTFS `FILE` record or an
+    /// `$I30` index entry found outside the live `$MFT`.
+    pub const CARVED: &str = "carved";
+    /// Rows built without stating a source (tests, library users).
+    pub const UNKNOWN: &str = "unknown";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub timestamp: String,
@@ -16,6 +36,10 @@ pub struct TimelineEntry {
     pub gid: u32,
     pub meta: String,
     pub file_name: String,
+    /// One of the constants in [`source`].
+    pub source: &'static str,
+    /// Anti-forensics indicators from [`crate::anomaly`], `+`-joined; usually empty.
+    pub flags: String,
 }
 
 impl TimelineEntry {
@@ -42,7 +66,21 @@ impl TimelineEntry {
             gid,
             meta,
             file_name,
+            source: source::UNKNOWN,
+            flags: String::new(),
         }
+    }
+
+    /// Sets the `source` column (see [`source`]).
+    pub fn with_source(mut self, source: &'static str) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Sets the `flags` column (see [`crate::anomaly`]).
+    pub fn with_flags(mut self, flags: String) -> Self {
+        self.flags = flags;
+        self
     }
 }
 
@@ -102,10 +140,13 @@ pub fn escape_csv_text(val: &str) -> String {
 /// header cannot drift between the writer and its assertions.
 ///
 /// `time_created` is the timestamp of the MACB event each row represents.
-pub const CSV_HEADER: &str = "time_created,size,type,mode,uid,gid,meta,file_name";
+/// `source` says what kind of evidence the row comes from (see [`source`]);
+/// rows recovered by `--carve` say `carved`. `flags` lists anti-forensics
+/// indicators (see [`crate::anomaly`]) and is empty on most rows.
+pub const CSV_HEADER: &str = "time_created,size,type,mode,uid,gid,meta,file_name,source,flags";
 
 /// Number of columns in [`CSV_HEADER`].
-pub const CSV_COLUMNS: usize = 8;
+pub const CSV_COLUMNS: usize = 10;
 
 /// Formats one timeline entry as a CSV row (without trailing newline).
 /// Every column is escaped: `meta` and `file_name` carry evidence-controlled
@@ -113,7 +154,7 @@ pub const CSV_COLUMNS: usize = 8;
 /// shift columns.
 pub fn format_csv_row(entry: &TimelineEntry) -> String {
     format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{}",
         escape_csv(&entry.timestamp),
         entry.size,
         escape_csv(&entry.macb),
@@ -121,7 +162,9 @@ pub fn format_csv_row(entry: &TimelineEntry) -> String {
         entry.uid,
         entry.gid,
         escape_csv_text(&entry.meta),
-        escape_csv_text(&entry.file_name)
+        escape_csv_text(&entry.file_name),
+        entry.source,
+        escape_csv(&entry.flags)
     )
 }
 
@@ -234,6 +277,8 @@ mod tests {
         );
         let row = format_csv_row(&e);
         // The injected comma in meta must stay inside one quoted cell.
-        assert_eq!(row, "2024-01-01T00:00:00Z,1,m...,-rw-r--r--,0,0,\"4230,evil\",/etc/passwd");
+        assert_eq!(row, "2024-01-01T00:00:00Z,1,m...,-rw-r--r--,0,0,\"4230,evil\",/etc/passwd,unknown,");
+        let row = format_csv_row(&e.with_source(source::CARVED).with_flags("future+pre_1980".into()));
+        assert!(row.ends_with(",carved,future+pre_1980"));
     }
 }

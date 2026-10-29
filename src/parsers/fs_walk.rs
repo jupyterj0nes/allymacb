@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::timefmt::format_unix_timestamp;
-use crate::timeline::{join_macb_flags, TimelineEntry};
+use crate::anomaly;
+use crate::timeline::{join_macb_flags, source, TimelineEntry};
 
 /// Options controlling how a live/extracted directory tree is timelined.
 #[derive(Debug, Clone, Default)]
@@ -166,6 +167,19 @@ pub fn walk_directory_timeline_with(
             }
         }
 
+        let flags = anomaly::column(
+            &[
+                anomaly::unix_flags(
+                    meta.modified().ok().map(|t| system_time_to_unix(t).0),
+                    ctime.map(|c| c.0),
+                    meta.created().ok().map(|t| system_time_to_unix(t).0),
+                    anomaly::now_secs(),
+                ),
+                anomaly::name_flags(&display_path),
+            ]
+            .concat(),
+        );
+
         for ((secs, nanos), macb) in ts_map {
             if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
                 timeline.push(TimelineEntry::new(
@@ -179,7 +193,7 @@ pub fn walk_directory_timeline_with(
                     gid,
                     inode.clone(),
                     display_path.clone(),
-                ));
+                ).with_source(source::FS).with_flags(flags.clone()));
             }
         }
     }

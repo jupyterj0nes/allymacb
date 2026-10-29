@@ -1,3 +1,4 @@
+pub mod anomaly;
 pub mod cli;
 pub mod error;
 pub mod ingest;

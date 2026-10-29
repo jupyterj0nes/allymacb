@@ -11,16 +11,17 @@ use mft::attribute::{MftAttributeContent, MftAttributeType};
 use mft::entry::MftEntry;
 use mft::MftParser;
 
+use crate::anomaly;
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::{format_unix_timestamp, SECS_BETWEEN_1601_AND_1970};
-use crate::timeline::{join_macb_flags, TimelineEntry};
+use crate::timeline::{join_macb_flags, source, TimelineEntry};
 
 /// MFT record number of the volume root directory.
-const ROOT_RECORD: u64 = 5;
+pub(crate) const ROOT_RECORD: u64 = 5;
 /// Maximum parent chain length followed when reconstructing a path.
-const MAX_PATH_DEPTH: usize = 512;
+pub(crate) const MAX_PATH_DEPTH: usize = 512;
 /// Valid NTFS file record sizes.
-const VALID_ENTRY_SIZES: [u32; 2] = [1024, 4096];
+pub(crate) const VALID_ENTRY_SIZES: [u32; 2] = [1024, 4096];
 /// How far into a damaged $MFT we look for the first intact record.
 const RECOVERY_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
 
@@ -31,6 +32,10 @@ pub struct MftParseOptions {
     pub resident_report: Option<PathBuf>,
     pub drive_letter: Option<char>,
     pub quiet: bool,
+    /// Scan disk images and unrecognised blobs sector by sector for NTFS
+    /// `FILE` records and `$I30` index entries that are not in the live
+    /// `$MFT`. Off unless `--carve` is given; rows are tagged `carved`.
+    pub carve: bool,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -45,19 +50,19 @@ pub struct ResidentStats {
 }
 
 /// Helper struct to hold unique timestamp entries for an attribute
-struct TimestampCollector {
+pub(crate) struct TimestampCollector {
     // map: (secs, nanos) -> macb string
-    entries: HashMap<(i64, u32), String>,
+    pub(crate) entries: HashMap<(i64, u32), String>,
 }
 
 impl TimestampCollector {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
         }
     }
 
-    fn add(&mut self, ts: &mft::Timestamp, flag: char) {
+    pub(crate) fn add(&mut self, ts: &mft::Timestamp, flag: char) {
         let secs = ts.as_second();
         // FILETIME 0 (1601-01-01) means "not set" on NTFS. Everything else,
         // including pre-1970 values, is kept: those are timestomping evidence.
@@ -73,7 +78,7 @@ impl TimestampCollector {
 
 /// Reader adapter that hides the first `skip` bytes of the underlying stream,
 /// used to hand the `mft` crate a stream whose first record is intact.
-struct SkipReader<R> {
+pub(crate) struct SkipReader<R> {
     inner: R,
     skip: u64,
 }
@@ -153,14 +158,14 @@ struct CachedDir {
     allocated: bool,
 }
 
-struct PathResolver {
+pub(crate) struct PathResolver {
     /// record number -> resolved directory
     cache: HashMap<u64, CachedDir>,
     /// Records skipped at the start of a damaged stream (see detect_entry_layout).
     skipped: u64,
 }
 
-enum Resolved {
+pub(crate) enum Resolved {
     Dir(String),
     Orphan,
     Cycle,
@@ -169,20 +174,20 @@ enum Resolved {
 /// A parent reference is valid when its sequence matches the record header.
 /// A freed record has its sequence bumped by one, so children of a deleted
 /// directory still resolve through it. Sequence 0 means "unknown": accept.
-fn sequence_matches(expected: u16, header_seq: u16, allocated: bool) -> bool {
+pub(crate) fn sequence_matches(expected: u16, header_seq: u16, allocated: bool) -> bool {
     expected == 0
         || header_seq == expected
         || (!allocated && header_seq == expected.wrapping_add(1))
 }
 
 impl PathResolver {
-    fn new(skipped: u64) -> Self {
+    pub(crate) fn new(skipped: u64) -> Self {
         let mut cache = HashMap::new();
         cache.insert(ROOT_RECORD, CachedDir { path: String::new(), seq: 0, allocated: true });
         Self { cache, skipped }
     }
 
-    fn get_entry<R: Read + Seek>(&self, parser: &mut MftParser<R>, record: u64) -> Option<MftEntry> {
+    pub(crate) fn get_entry<R: Read + Seek>(&self, parser: &mut MftParser<R>, record: u64) -> Option<MftEntry> {
         let idx = record.checked_sub(self.skipped)?;
         parser.get_entry(idx).ok()
     }
@@ -197,7 +202,7 @@ impl PathResolver {
     }
 
     /// Returns the directory path for `dir_record` (expected sequence `seq`).
-    fn resolve_dir<R: Read + Seek>(
+    pub(crate) fn resolve_dir<R: Read + Seek>(
         &mut self,
         parser: &mut MftParser<R>,
         dir_record: u64,
@@ -304,18 +309,18 @@ impl PathResolver {
 
 /// Attributes gathered from a base record plus its extension records.
 #[derive(Default)]
-struct RecordAttrs {
-    std_info: Option<StandardInfoAttr>,
-    fn_attrs: Vec<FileNameAttr>,
-    data_size: Option<u64>,
-    ads_streams: Vec<(String, u64)>,
+pub(crate) struct RecordAttrs {
+    pub(crate) std_info: Option<StandardInfoAttr>,
+    pub(crate) fn_attrs: Vec<FileNameAttr>,
+    pub(crate) data_size: Option<u64>,
+    pub(crate) ads_streams: Vec<(String, u64)>,
     /// (stream name or "" for the unnamed stream, bytes) of resident $DATA.
-    resident_payloads: Vec<(String, Vec<u8>)>,
+    pub(crate) resident_payloads: Vec<(String, Vec<u8>)>,
 }
 
 /// Collects the attributes of one record. Called for the base record first
 /// and then for every extension record, so the first value seen wins.
-fn scan_record(rec: &MftEntry, is_dir: bool, want_resident: bool, acc: &mut RecordAttrs) {
+pub(crate) fn scan_record(rec: &MftEntry, is_dir: bool, want_resident: bool, acc: &mut RecordAttrs) {
     for attr in rec.iter_attributes().flatten() {
         match &attr.data {
             MftAttributeContent::AttrX10(info) => {
@@ -368,7 +373,7 @@ fn scan_record(rec: &MftEntry, is_dir: bool, want_resident: bool, acc: &mut Reco
 /// Large or heavily fragmented files keep part of their attributes there,
 /// and the base record may then hold only the DOS 8.3 name and no $DATA.
 /// A non-resident $ATTRIBUTE_LIST cannot be read from the $MFT alone.
-fn extension_records(rec: &MftEntry, base_id: u64) -> Vec<u64> {
+pub(crate) fn extension_records(rec: &MftEntry, base_id: u64) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
     for attr in rec.iter_attributes().flatten() {
         if let MftAttributeContent::AttrX20(list) = &attr.data {
@@ -385,7 +390,7 @@ fn extension_records(rec: &MftEntry, base_id: u64) -> Vec<u64> {
 
 /// Picks the most human-readable $FILE_NAME: Win32 / Win32AndDos first,
 /// then POSIX, then whatever is left (DOS 8.3).
-fn best_name(fns: &[FileNameAttr]) -> Option<FileNameAttr> {
+pub(crate) fn best_name(fns: &[FileNameAttr]) -> Option<FileNameAttr> {
     fns.iter()
         .find(|a| matches!(a.namespace, FileNamespace::Win32 | FileNamespace::Win32AndDos))
         .or_else(|| fns.iter().find(|a| a.namespace == FileNamespace::POSIX))
@@ -393,22 +398,154 @@ fn best_name(fns: &[FileNameAttr]) -> Option<FileNameAttr> {
         .cloned()
 }
 
-pub fn parse_mft_reader<R: Read + Seek>(
-    mut reader: R,
-    options: &MftParseOptions,
-) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+/// What one record needs to become timeline rows, independent of where the
+/// record came from (live `$MFT` or carved from raw sectors).
+pub(crate) struct RowSpec<'a> {
+    pub entry_id: u64,
+    pub is_dir: bool,
+    pub is_allocated: bool,
+    /// Full path including the drive prefix, e.g. `C:\dir\file.txt`.
+    pub resolved_path: &'a str,
+    /// Appended to every file name, e.g. ` (carved @0x1A2B3C00)`.
+    pub suffix: &'a str,
+    pub source: &'static str,
+    pub include_file_name: bool,
+    /// Indicators the caller already knows (e.g. `backdated`), added to the
+    /// ones computed from the record itself.
+    pub extra_flags: &'a [&'static str],
+}
+
+/// Emits the MACB rows of one record: `$STANDARD_INFORMATION` rows (plus one
+/// row per ADS with the same flags) and, when asked, `$FILE_NAME` rows.
+pub(crate) fn record_rows(
+    spec: &RowSpec,
+    std_info: Option<&StandardInfoAttr>,
+    fn_attrs: &[FileNameAttr],
+    data_size: Option<u64>,
+    ads_streams: &[(String, u64)],
+    out: &mut Vec<TimelineEntry>,
+) {
+    let base_mode = if spec.is_dir { "d/drwxrwxrwx" } else { "-/-rwxrwxrwx" };
+    let status_flag = if spec.is_allocated { "" } else { " (deleted)" };
+    let fn_size = fn_attrs.iter().map(|f| f.logical_size).find(|&s| s > 0).unwrap_or(0);
+    let file_size = data_size.unwrap_or(fn_size);
+    let meta = spec.entry_id.to_string();
+
+    // Anti-forensics indicators: the same string on every row of the record.
+    let mut indicators = anomaly::ntfs_flags(std_info, fn_attrs, anomaly::now_secs());
+    for f in fn_attrs {
+        for i in anomaly::name_flags(&f.name) {
+            if !indicators.contains(&i) {
+                indicators.push(i);
+            }
+        }
+    }
+    for i in spec.extra_flags {
+        if !indicators.contains(i) {
+            indicators.push(i);
+        }
+    }
+    let flags = anomaly::column(&indicators);
+
+    if let Some(info) = std_info {
+        let mut collector = TimestampCollector::new();
+        collector.add(&info.modified, 'm');
+        collector.add(&info.accessed, 'a');
+        collector.add(&info.mft_modified, 'c');
+        collector.add(&info.created, 'b');
+
+        for ((secs, nanos), macb) in collector.entries {
+            if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
+                let full_name = format!("{}{}{}", spec.resolved_path, status_flag, spec.suffix);
+                out.push(
+                    TimelineEntry::new(
+                        ts_iso.clone(),
+                        secs,
+                        nanos,
+                        file_size,
+                        macb.clone(),
+                        base_mode.to_string(),
+                        0,
+                        0,
+                        meta.clone(),
+                        full_name,
+                    )
+                    .with_source(spec.source)
+                    .with_flags(flags.clone()),
+                );
+
+                // ADS share the record's $STANDARD_INFORMATION timestamps,
+                // so they carry the same MACB flags.
+                for (stream_name, stream_size) in ads_streams {
+                    let ads_full_name = format!("{}:{}{}{}", spec.resolved_path, stream_name, status_flag, spec.suffix);
+                    out.push(
+                        TimelineEntry::new(
+                            ts_iso.clone(),
+                            secs,
+                            nanos,
+                            *stream_size,
+                            macb.clone(),
+                            base_mode.to_string(),
+                            0,
+                            0,
+                            meta.clone(),
+                            ads_full_name,
+                        )
+                        .with_source(spec.source)
+                        .with_flags(flags.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    if spec.include_file_name {
+        for fn_attr in fn_attrs {
+            let mut collector = TimestampCollector::new();
+            collector.add(&fn_attr.modified, 'm');
+            collector.add(&fn_attr.accessed, 'a');
+            collector.add(&fn_attr.mft_modified, 'c');
+            collector.add(&fn_attr.created, 'b');
+
+            for ((secs, nanos), macb) in collector.entries {
+                if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
+                    let fn_full_name = format!(
+                        "{}{} ($FILE_NAME: {}){}",
+                        spec.resolved_path, status_flag, fn_attr.name, spec.suffix
+                    );
+                    let fn_row_size = if fn_attr.logical_size > 0 { fn_attr.logical_size } else { file_size };
+                    out.push(
+                        TimelineEntry::new(
+                            ts_iso,
+                            secs,
+                            nanos,
+                            fn_row_size,
+                            macb,
+                            base_mode.to_string(),
+                            0,
+                            0,
+                            meta.clone(),
+                            fn_full_name,
+                        )
+                        .with_source(spec.source)
+                        .with_flags(flags.clone()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Opens an `$MFT` stream with the `mft` crate, skipping a damaged prefix.
+/// Returns the parser and how many records were skipped (record numbers
+/// reported by the parser must be offset by that amount).
+pub(crate) fn open_mft_parser<R: Read + Seek>(mut reader: R) -> Result<(MftParser<SkipReader<R>>, u64)> {
     let stream_len = reader.seek(SeekFrom::End(0)).map_err(|e| AllyError::Io {
         code: ErrorCode::IoError,
         source: e,
         context: "Measuring $MFT stream".to_string(),
     })?;
     let (entry_size, skipped) = detect_entry_layout(&mut reader, stream_len)?;
-    if skipped > 0 {
-        eprintln!(
-            "[!] $MFT: first {} record(s) are damaged and were skipped; paths through them will show as [ORPHAN]",
-            skipped
-        );
-    }
     let skip_bytes = skipped * u64::from(entry_size);
     let remaining = stream_len.saturating_sub(skip_bytes);
     let mut skipping = SkipReader { inner: reader, skip: skip_bytes };
@@ -419,11 +556,25 @@ pub fn parse_mft_reader<R: Read + Seek>(
         context: "Positioning $MFT stream".to_string(),
     })?;
 
-    let mut parser = MftParser::from_read_seek(skipping, Some(remaining)).map_err(|e| AllyError::Mft {
+    let parser = MftParser::from_read_seek(skipping, Some(remaining)).map_err(|e| AllyError::Mft {
         code: ErrorCode::MftInitFailed,
         entry: None,
         message: format!("Failed to initialize MFT parser: {}", e),
     })?;
+    Ok((parser, skipped))
+}
+
+pub fn parse_mft_reader<R: Read + Seek>(
+    reader: R,
+    options: &MftParseOptions,
+) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    let (mut parser, skipped) = open_mft_parser(reader)?;
+    if skipped > 0 {
+        eprintln!(
+            "[!] $MFT: first {} record(s) are damaged and were skipped; paths through them will show as [ORPHAN]",
+            skipped
+        );
+    }
 
     let entry_count = parser.get_entry_count();
 
@@ -461,18 +612,6 @@ pub fn parse_mft_reader<R: Read + Seek>(
         let is_dir = entry.is_dir();
         let is_allocated = entry.is_allocated();
 
-        let base_mode = if is_dir {
-            "d/drwxrwxrwx".to_string()
-        } else {
-            "-/-rwxrwxrwx".to_string()
-        };
-
-        let status_flag = if is_allocated {
-            String::new()
-        } else {
-            " (deleted)".to_string()
-        };
-
         // Collect attributes: $STANDARD_INFORMATION (0x10), $FILE_NAME (0x30),
         // $DATA (0x80), following $ATTRIBUTE_LIST (0x20) into extension records.
         let want_resident = options.resident_dir.is_some();
@@ -492,9 +631,6 @@ pub fn parse_mft_reader<R: Read + Seek>(
             None => format!("{}:\\[UNKNOWN]\\entry_{}", drive_prefix, entry_id),
         };
 
-        let fn_size = fn_attrs.iter().map(|f| f.logical_size).find(|&s| s > 0).unwrap_or(0);
-        let file_size = data_size.unwrap_or(fn_size);
-
         if let Some(ref res_dir) = options.resident_dir {
             for (stream_name, bytes) in &resident_payloads {
                 let target = if stream_name.is_empty() {
@@ -506,85 +642,17 @@ pub fn parse_mft_reader<R: Read + Seek>(
             }
         }
 
-        // 1. Process $STANDARD_INFORMATION (0x10) timestamps
-        if let Some(info) = std_info {
-            let mut collector = TimestampCollector::new();
-            collector.add(&info.modified, 'm');
-            collector.add(&info.accessed, 'a');
-            collector.add(&info.mft_modified, 'c');
-            collector.add(&info.created, 'b');
-
-            for ((secs, nanos), macb) in collector.entries {
-                if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
-                    let full_name = format!("{}{}", resolved_path, status_flag);
-                    timeline.push(TimelineEntry::new(
-                        ts_iso.clone(),
-                        secs,
-                        nanos,
-                        file_size,
-                        macb.clone(),
-                        base_mode.clone(),
-                        0,
-                        0,
-                        entry_id.to_string(),
-                        full_name,
-                    ));
-
-                    // ADS share the record's $STANDARD_INFORMATION timestamps,
-                    // so they carry the same MACB flags.
-                    for (stream_name, stream_size) in &ads_streams {
-                        let ads_full_name = format!("{}:{}{}", resolved_path, stream_name, status_flag);
-                        timeline.push(TimelineEntry::new(
-                            ts_iso.clone(),
-                            secs,
-                            nanos,
-                            *stream_size,
-                            macb.clone(),
-                            base_mode.clone(),
-                            0,
-                            0,
-                            entry_id.to_string(),
-                            ads_full_name,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // 2. Process $FILE_NAME (0x30) timestamps if requested
-        if options.include_file_name_timestamps {
-            for fn_attr in fn_attrs {
-                let mut collector = TimestampCollector::new();
-                collector.add(&fn_attr.modified, 'm');
-                collector.add(&fn_attr.accessed, 'a');
-                collector.add(&fn_attr.mft_modified, 'c');
-                collector.add(&fn_attr.created, 'b');
-
-                for ((secs, nanos), macb) in collector.entries {
-                    if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
-                        let fn_full_name = format!("{}{} ($FILE_NAME: {})", resolved_path, status_flag, fn_attr.name);
-                        let fn_row_size = if fn_attr.logical_size > 0 {
-                            fn_attr.logical_size
-                        } else {
-                            file_size
-                        };
-
-                        timeline.push(TimelineEntry::new(
-                            ts_iso,
-                            secs,
-                            nanos,
-                            fn_row_size,
-                            macb,
-                            base_mode.clone(),
-                            0,
-                            0,
-                            entry_id.to_string(),
-                            fn_full_name,
-                        ));
-                    }
-                }
-            }
-        }
+        let spec = RowSpec {
+            entry_id,
+            is_dir,
+            is_allocated,
+            resolved_path: &resolved_path,
+            suffix: "",
+            source: source::MFT,
+            include_file_name: options.include_file_name_timestamps,
+            extra_flags: &[],
+        };
+        record_rows(&spec, std_info.as_ref(), &fn_attrs, data_size, &ads_streams, &mut timeline);
     }
 
     if let Some(pb) = pb {

@@ -8,7 +8,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::{filetime_to_datetime, format_utc_iso};
-use crate::timeline::TimelineEntry;
+use crate::anomaly;
+use crate::timeline::{source, TimelineEntry};
 
 /// Parent-directory path cache: MFT entry number -> (full directory path, size).
 /// When present, the directory path of the record's *parent* reference is
@@ -335,7 +336,9 @@ pub fn parse_usn_reader_with_report<R: Read + Seek>(
                 0,
                 entry_id.to_string(),
                 display_name,
-            ));
+            )
+            .with_source(source::USN)
+            .with_flags(anomaly::column(&[anomaly::usn_flags(fixed.reason), anomaly::name_flags(&file_name)].concat())));
             report.records_parsed += 1;
         } else {
             report.records_no_timestamp += 1;

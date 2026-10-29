@@ -11,6 +11,7 @@ use crate::parsers::mft::{MftParseOptions, ResidentStats};
 use crate::timeline::TimelineEntry;
 
 use super::archive::staging_path;
+use super::carve::{carve_stream, describe_stats, VolumeContext};
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EXT_MAGIC_OFFSET: u64 = 1080;
@@ -363,37 +364,75 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
     let mut total_stats = ResidentStats::default();
 
     let partitions = find_partitions(&mut reader, total_size);
-    if partitions.is_empty() {
-        return Err(AllyError::Image {
-            code: ErrorCode::ImagePartitionTableCorrupt,
-            path: label.to_string(),
-            message: "No NTFS or ext4 filesystem found (checked bare filesystem, GPT, MBR/EBR and common offsets)".to_string(),
-        });
+    let no_filesystem = || AllyError::Image {
+        code: ErrorCode::ImagePartitionTableCorrupt,
+        path: label.to_string(),
+        message: "No NTFS or ext4 filesystem found (checked bare filesystem, GPT, MBR/EBR and common offsets)".to_string(),
+    };
+    if partitions.is_empty() && !mft_options.carve {
+        return Err(no_filesystem());
     }
     if !mft_options.quiet {
         eprintln!("    [i] {} partition(s) with a supported filesystem", partitions.len());
     }
 
+    // NTFS volumes found, with their live $MFT kept on disk for the carver.
+    let mut volumes: Vec<VolumeContext> = Vec::new();
     let mut failures = 0usize;
     for part in partitions {
         match part.ptype {
             PartitionType::Ntfs => {
                 let mut offset_reader = OffsetReader::new(&mut reader, part.offset);
-                match extract_and_parse_ntfs(&mut offset_reader, mft_options, temp_dir) {
-                    Ok((timeline, stats)) => {
-                        combined_timeline.extend(timeline);
-                        total_stats.total_extracted += stats.total_extracted;
-                        total_stats.total_bytes += stats.total_bytes;
-                        total_stats.total_failed += stats.total_failed;
-                        total_stats.total_unsafe_paths += stats.total_unsafe_paths;
+                match extract_and_parse_ntfs(&mut offset_reader, mft_options, temp_dir, mft_options.carve) {
+                    Ok(parsed) => {
+                        combined_timeline.extend(parsed.timeline);
+                        total_stats.total_extracted += parsed.stats.total_extracted;
+                        total_stats.total_bytes += parsed.stats.total_bytes;
+                        total_stats.total_failed += parsed.stats.total_failed;
+                        total_stats.total_unsafe_paths += parsed.stats.total_unsafe_paths;
+                        let free_known = parsed.free_ranges.is_some();
+                        let free_ranges = parsed.free_ranges.unwrap_or_default().into_iter().map(|(s, l)| (part.offset + s, l)).collect();
+                        volumes.push(VolumeContext {
+                            start: part.offset,
+                            end: part.offset.saturating_add(parsed.volume_size),
+                            live_mft: parsed.mft_dump,
+                            free_ranges,
+                            free_known,
+                        });
                     }
                     Err(e) => {
                         failures += 1;
                         eprintln!("[!] NTFS partition @0x{:X} in {}: {}", part.offset, label, e);
+                        // Still carve the range; parents just cannot be checked against a live table.
+                        volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false });
                     }
                 }
             }
             PartitionType::Ext4 => {
+                // Raw reader first: inode numbers, ctime, deleted inodes and
+                // (with --carve) the journal. ext4-view stays as the fallback
+                // for layouts the raw reader does not handle.
+                let raw = crate::parsers::ext4raw::parse_ext4_raw(&mut reader, part.offset, mft_options.carve);
+                match raw {
+                    Ok((timeline, rep)) => {
+                        if !mft_options.quiet {
+                            eprintln!("    [+] ext4 @0x{:X}: {}", part.offset, crate::parsers::ext4raw::describe(&rep, mft_options.carve));
+                        }
+                        combined_timeline.extend(timeline);
+                        if mft_options.carve {
+                            // Free space of the volume, so log lines and utmp
+                            // records are carved only from unallocated blocks.
+                            match crate::parsers::ext4raw::free_space(&mut reader, part.offset) {
+                                Some(((start, end), free)) => volumes.push(VolumeContext { start, end, live_mft: None, free_ranges: free, free_known: true }),
+                                None => volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false }),
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[!] ext4 @0x{:X}: raw reader failed ({}); falling back to ext4-view (no ctime, no inode numbers, no deleted inodes)", part.offset, e);
+                    }
+                }
                 let reader_arc = Arc::new(Mutex::new(reader));
                 match parse_ext4_partition(reader_arc.clone(), part.offset) {
                     Ok(timeline) => combined_timeline.extend(timeline),
@@ -416,6 +455,46 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     })?;
             }
             PartitionType::Unknown => {}
+        }
+    }
+
+    if mft_options.carve {
+        // A volume whose end is unknown reaches up to the next one.
+        volumes.sort_by_key(|v| v.start);
+        for i in 0..volumes.len() {
+            if volumes[i].end == u64::MAX {
+                volumes[i].end = volumes.get(i + 1).map(|n| n.start).unwrap_or(total_size);
+            }
+        }
+        if !mft_options.quiet {
+            eprintln!("    [*] Carving {} for NTFS FILE records and $I30 entries outside the live $MFT...", label);
+        }
+        let carved = carve_stream(&mut reader, total_size, &volumes, mft_options, label, &combined_timeline);
+        for v in &volumes {
+            if let Some(p) = &v.live_mft {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        match carved {
+            Ok((entries, stats)) => {
+                if !mft_options.quiet {
+                    eprintln!("    [+] Carving: {} ({} rows)", describe_stats(&stats), entries.len());
+                }
+                if !stats.backdated_records.is_empty() {
+                    let backdated: std::collections::HashSet<String> = stats.backdated_records.iter().map(|r| r.to_string()).collect();
+                    for e in combined_timeline.iter_mut().filter(|e| e.source == crate::timeline::source::MFT && backdated.contains(&e.meta)) {
+                        e.flags = crate::anomaly::add_to_column(&e.flags, crate::anomaly::BACKDATED);
+                    }
+                }
+                combined_timeline.extend(entries);
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("[!] Carving {}: {}", label, e);
+            }
+        }
+        if combined_timeline.is_empty() && volumes.is_empty() {
+            return Err(no_filesystem());
         }
     }
 
@@ -487,16 +566,63 @@ fn unsupported_container(label: &str, fmt: ContainerFormat) -> AllyError {
     }
 }
 
+/// Result of parsing one NTFS partition of an image.
+struct NtfsVolumeParse {
+    timeline: Vec<TimelineEntry>,
+    stats: ResidentStats,
+    /// Volume size in bytes from the boot sector.
+    volume_size: u64,
+    /// The dumped `$MFT`, kept on disk only when `keep_dump` was asked.
+    mft_dump: Option<PathBuf>,
+    /// Free clusters from `$Bitmap` as volume-relative `(start, len)` byte
+    /// ranges; `None` when the bitmap could not be read (or was not asked).
+    free_ranges: Option<Vec<(u64, u64)>>,
+}
+
+/// Reads `$Bitmap` (record 6) and returns the unallocated clusters as
+/// volume-relative byte ranges.
+fn ntfs_free_ranges<R: Read + Seek>(ntfs: &Ntfs, reader: &mut R) -> Option<Vec<(u64, u64)>> {
+    let bitmap_file = ntfs.file(reader, 6).ok()?;
+    let item = bitmap_file.data(reader, "")?.ok()?;
+    let attr = item.to_attribute().ok()?;
+    let value = attr.value(reader).ok()?;
+    let mut bits = Vec::new();
+    value.attach(reader).read_to_end(&mut bits).ok()?;
+    let cluster = u64::from(ntfs.cluster_size());
+    let total_clusters = ntfs.size() / cluster;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut c = 0u64;
+    while c < total_clusters {
+        let byte = bits.get((c / 8) as usize).copied().unwrap_or(0xFF);
+        if byte == 0xFF {
+            c = (c / 8 + 1) * 8;
+            continue;
+        }
+        if byte & (1 << (c % 8)) == 0 {
+            let start = c * cluster;
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == start => last.1 += cluster,
+                _ => out.push((start, cluster)),
+            }
+        }
+        c += 1;
+    }
+    Some(out)
+}
+
 fn extract_and_parse_ntfs<R: Read + Seek>(
     reader: &mut R,
     mft_options: &MftParseOptions,
     temp_dir: &Path,
-) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    keep_dump: bool,
+) -> Result<NtfsVolumeParse> {
     let ntfs = Ntfs::new(reader).map_err(|e| AllyError::Mft {
         code: ErrorCode::MftInitFailed,
         entry: None,
         message: format!("Failed reading NTFS volume: {}", e),
     })?;
+    let volume_size = ntfs.size();
+    let free_ranges = if keep_dump { ntfs_free_ranges(&ntfs, reader) } else { None };
 
     // In NTFS, record 0 is $MFT
     let mft_file = ntfs.file(reader, 0).map_err(|e| AllyError::Mft {
@@ -540,8 +666,17 @@ fn extract_and_parse_ntfs<R: Read + Seek>(
     }
 
     let result = crate::parsers::mft::parse_mft_file(&mft_temp_path, mft_options);
-    let _ = std::fs::remove_file(&mft_temp_path);
-    result
+    match result {
+        Ok((timeline, stats)) if keep_dump => Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: Some(mft_temp_path), free_ranges }),
+        Ok((timeline, stats)) => {
+            let _ = std::fs::remove_file(&mft_temp_path);
+            Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: None, free_ranges })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&mft_temp_path);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
