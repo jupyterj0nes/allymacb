@@ -18,14 +18,22 @@
 //! volume that no longer exists, or an index entry of a deleted child is
 //! kept and reported with `source = carved` and its absolute offset.
 //!
-//! The scan runs only when the analyst asks for it (`--carve`).
+//! The scan runs only when the analyst asks for it (`--carve`). The block
+//! scanner and the structure validators are the `blockcarve` crate shared
+//! with masstin, faramir and caarea; what is kept, how it is compared with
+//! the live `$MFT` and how it becomes a row is decided here.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
+pub use blockcarve::ntfs::{file_record_size, parse_indx_block, split_ref, IndxEntry};
+use blockcarve::ntfs::{file_record_number as header_record_number, FILE_MAGIC, FN_FLAG_DIRECTORY, INDX_MAGIC};
+use blockcarve::scan::{scan_many, HitAction, ScanConfig, BLOCK_SIZE};
+use blockcarve::source::DirectSource;
 use indicatif::{ProgressBar, ProgressStyle};
 use mft::attribute::x30::FileNameAttr;
 use mft::entry::MftEntry;
@@ -37,26 +45,18 @@ use crate::error::{AllyError, Result};
 use crate::parsers::mft::{
     best_name, extension_records, open_mft_parser, record_rows, scan_record, sequence_matches, MftParseOptions,
     PathResolver, RecordAttrs, Resolved, RowSpec, SkipReader, TimestampCollector, MAX_PATH_DEPTH, ROOT_RECORD,
-    VALID_ENTRY_SIZES,
 };
 use crate::timefmt::format_unix_timestamp;
 use crate::timeline::{source, TimelineEntry};
 
-/// Bytes read per iteration.
-const BLOCK_SIZE: usize = 4 * 1024 * 1024;
-/// Largest structure we recognise; kept from one block to the next so a
-/// record straddling two reads is still seen whole.
+/// Largest structure we recognise; the scanner keeps this much from one block
+/// to the next so a record straddling two reads is still seen whole.
 const CARRY: usize = 64 * 1024;
 /// Both structures start on a sector boundary.
 const STEP: usize = 512;
-/// Give up on a stream after this many consecutive read errors.
-const MAX_READ_ERRORS: usize = 16;
-/// FILETIME of 1970-01-01: INDX slack entries with timestamps before this
-/// (or after 2^63) are treated as garbage. FILE records need no such filter,
-/// their fixups already prove the structure.
-const FILETIME_1970: u64 = 116_444_736_000_000_000;
-/// `$FILE_NAME` flag for directories.
-const FN_FLAG_DIRECTORY: u32 = 0x1000_0000;
+/// Longest log line or `utmp` record that may straddle two blocks: the last
+/// bytes of every block wait for the next one before text carving looks at them.
+const TEXT_TAIL: usize = 8192;
 
 /// An NTFS volume inside the scanned stream, with the live `$MFT` dumped to
 /// a file when it could be read.
@@ -284,175 +284,6 @@ struct CarvedDir {
     parent_seq: u16,
 }
 
-/// Returns the size of a valid `FILE` record at the start of `buf`.
-pub fn file_record_size(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 48 || &buf[0..4] != b"FILE" {
-        return None;
-    }
-    let usa_offset = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-    let usa_count = u16::from_le_bytes([buf[6], buf[7]]) as usize;
-    let first_attr = u16::from_le_bytes([buf[20], buf[21]]) as usize;
-    let used = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) as usize;
-    let total = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-    if !VALID_ENTRY_SIZES.contains(&total) {
-        return None;
-    }
-    let size = total as usize;
-    if buf.len() < size || usa_count != size / 512 + 1 {
-        return None;
-    }
-    if usa_offset < 0x2A || usa_offset + usa_count * 2 > first_attr || first_attr + 8 > size || used > size || used < first_attr {
-        return None;
-    }
-    let usn = &buf[usa_offset..usa_offset + 2];
-    for i in 1..usa_count {
-        if &buf[i * 512 - 2..i * 512] != usn {
-            return None;
-        }
-    }
-    Some(size)
-}
-
-/// Record number stored in the header (NTFS 3.1+), 0 when the header is the
-/// older short form.
-fn header_record_number(buf: &[u8]) -> u64 {
-    let usa_offset = u16::from_le_bytes([buf[4], buf[5]]);
-    if usa_offset >= 0x30 {
-        u64::from(u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]))
-    } else {
-        0
-    }
-}
-
-/// One parsed `$I30` entry: (offset inside the block, file reference, raw
-/// `$FILE_NAME` flags, attribute).
-pub struct IndxEntry {
-    pub offset: usize,
-    pub file_ref: u64,
-    pub flags: u32,
-    pub fname: FileNameAttr,
-}
-
-/// Validates an `INDX` block at the start of `buf`, applies its fixups and
-/// returns its size with every entry found in the live chain and in the
-/// slack.
-pub fn parse_indx_block(buf: &[u8]) -> Option<(usize, Vec<IndxEntry>)> {
-    if buf.len() < 0x58 || &buf[0..4] != b"INDX" {
-        return None;
-    }
-    let usa_offset = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-    let usa_count = u16::from_le_bytes([buf[6], buf[7]]) as usize;
-    if !(3..=129).contains(&usa_count) {
-        return None;
-    }
-    let size = (usa_count - 1) * 512;
-    if buf.len() < size || usa_offset < 0x28 || usa_offset + usa_count * 2 > size {
-        return None;
-    }
-    let entries_offset = u32::from_le_bytes(buf[24..28].try_into().ok()?) as usize;
-    let index_size = u32::from_le_bytes(buf[28..32].try_into().ok()?) as usize;
-    let alloc_size = u32::from_le_bytes(buf[32..36].try_into().ok()?) as usize;
-    if entries_offset < 0x10 || 24 + alloc_size > size || index_size > alloc_size || entries_offset > index_size {
-        return None;
-    }
-    if usa_offset + usa_count * 2 > 24 + entries_offset {
-        return None;
-    }
-
-    let mut block = buf[..size].to_vec();
-    let usn = [block[usa_offset], block[usa_offset + 1]];
-    for i in 1..usa_count {
-        let end = i * 512;
-        if block[end - 2..end] != usn {
-            return None;
-        }
-        let fix = usa_offset + i * 2;
-        block[end - 2] = block[fix];
-        block[end - 1] = block[fix + 1];
-    }
-
-    let mut out = Vec::new();
-    let live_end = 24 + index_size;
-    let block_end = 24 + alloc_size;
-
-    // Live chain: sequential entries until the LAST flag.
-    let mut pos = 24 + entries_offset;
-    while pos + 16 <= live_end {
-        let (len, flags) = entry_header(&block, pos);
-        if flags & 0x02 != 0 || len < 16 || len % 8 != 0 || pos + len > live_end {
-            break;
-        }
-        if let Some(e) = try_entry(&block, pos, false) {
-            out.push(e);
-        }
-        pos += len;
-    }
-
-    // Slack: anything 8-byte aligned that still looks like an entry.
-    let mut pos = (live_end + 7) & !7;
-    while pos + 0x58 <= block_end {
-        match try_entry(&block, pos, true) {
-            Some(e) => {
-                let (len, _) = entry_header(&block, pos);
-                out.push(e);
-                pos += len.max(8);
-            }
-            None => pos += 8,
-        }
-    }
-
-    Some((size, out))
-}
-
-fn entry_header(block: &[u8], pos: usize) -> (usize, u32) {
-    let len = u16::from_le_bytes([block[pos + 8], block[pos + 9]]) as usize;
-    let flags = u32::from_le_bytes(block[pos + 12..pos + 16].try_into().unwrap_or([0; 4]));
-    (len, flags)
-}
-
-/// Parses the index entry at `pos`. `strict` adds the plausibility checks
-/// needed when the entry comes from slack instead of the live chain.
-fn try_entry(block: &[u8], pos: usize, strict: bool) -> Option<IndxEntry> {
-    if pos + 0x58 > block.len() {
-        return None;
-    }
-    let file_ref = u64::from_le_bytes(block[pos..pos + 8].try_into().ok()?);
-    let (len, flags) = entry_header(block, pos);
-    let fn_len = u16::from_le_bytes([block[pos + 10], block[pos + 11]]) as usize;
-    let fn_start = pos + 16;
-    if fn_len < 0x44 || fn_start + fn_len > block.len() || len < 16 + fn_len {
-        return None;
-    }
-    let name_len = block[fn_start + 0x40] as usize;
-    let namespace = block[fn_start + 0x41];
-    if name_len == 0 || namespace > 3 || fn_len != 0x42 + 2 * name_len {
-        return None;
-    }
-    if strict {
-        let expected = (16 + fn_len + 7) & !7;
-        let expected = if flags & 0x01 != 0 { expected + 8 } else { expected };
-        if len != expected || flags & !0x03 != 0 {
-            return None;
-        }
-        for i in 0..4 {
-            let t = u64::from_le_bytes(block[fn_start + 8 + i * 8..fn_start + 16 + i * 8].try_into().ok()?);
-            if t >= 1 << 63 || (t != 0 && t < FILETIME_1970) {
-                return None;
-            }
-        }
-    }
-    let fn_flags = u32::from_le_bytes(block[fn_start + 0x38..fn_start + 0x3C].try_into().ok()?);
-    let fname = FileNameAttr::from_stream(&mut Cursor::new(&block[fn_start..fn_start + fn_len])).ok()?;
-    if fname.name.chars().any(|c| c.is_control() || c == '\\' || c == '/') {
-        return None;
-    }
-    Some(IndxEntry { offset: pos, file_ref, flags: fn_flags, fname })
-}
-
-fn split_ref(file_ref: u64) -> (u64, u16) {
-    (file_ref & 0x0000_FFFF_FFFF_FFFF, (file_ref >> 48) as u16)
-}
-
 /// State of one carving run over a stream.
 struct Carver<'a> {
     options: &'a MftParseOptions,
@@ -468,6 +299,8 @@ struct Carver<'a> {
     free: FreeSpace,
     text_rows: Vec<TimelineEntry>,
     text_seen: HashSet<(i64, u32, &'static str, String)>,
+    /// Last bytes of the previous block, scanned together with the next one.
+    text_tail: Vec<u8>,
     now: i64,
 }
 
@@ -544,28 +377,45 @@ impl<'a> Carver<'a> {
             free: FreeSpace::from_contexts(contexts),
             text_rows: Vec::new(),
             text_seen: HashSet::new(),
+            text_tail: Vec::new(),
             now: anomaly::now_secs(),
         })
     }
 
-    /// Looks for log lines and utmp records in the free parts of
-    /// `buf[from..len]`, whose first byte sits at absolute offset `base`.
-    /// A record may run past `len` into the carried-over tail (`buf[..filled]`),
-    /// so the slices extend to `filled`, but only records that *start* before
-    /// `len` are taken; the rest are seen on the next pass.
-    fn scan_artifacts(&mut self, buf: &[u8], len: usize, filled: usize, base: u64, from: usize) {
-        if len <= from {
+    /// Looks for log lines and utmp records in the free parts of `block`,
+    /// whose first byte sits at absolute offset `base`. The scanner offers
+    /// every byte once, so the last [`TEXT_TAIL`] bytes are held back and
+    /// scanned in front of the next block: a line or record cut by the block
+    /// boundary is seen whole. `last` flushes what is held.
+    fn scan_artifacts(&mut self, base: u64, block: &[u8], last: bool) {
+        let joined;
+        let (base, data): (u64, &[u8]) = if self.text_tail.is_empty() {
+            (base, block)
+        } else {
+            let held = self.text_tail.len() as u64;
+            let mut j = std::mem::take(&mut self.text_tail);
+            j.extend_from_slice(block);
+            joined = j;
+            (base - held, &joined[..])
+        };
+        let accept_end = if last { data.len() } else { data.len().saturating_sub(TEXT_TAIL) };
+        if !last {
+            self.text_tail = data[accept_end..].to_vec();
+        }
+        if accept_end == 0 {
             return;
         }
-        for (s, e) in self.free.ranges_in(base + from as u64, base + len as u64) {
+        let filled = data.len();
+        for (s, e) in self.free.ranges_in(base, base + accept_end as u64) {
             let lo = (s - base) as usize;
             let hi = (e - base) as usize;
             if hi <= lo {
                 continue;
             }
-            // Extend to the end of the free range or of the buffer, whichever first.
+            // A record that starts before `hi` may run on: extend to the end of the free
+            // range or of the data, whichever comes first.
             let ext = self.free.ranges_in(e, base + filled as u64).first().filter(|r| r.0 == e).map_or(hi, |r| ((r.1 - base) as usize).min(filled));
-            let slice = &buf[lo..ext.max(hi)];
+            let slice = &data[lo..ext.max(hi)];
             self.stats.free_bytes_scanned += (hi - lo) as u64;
             let mut hits = carve_text::scan_text(slice, self.now);
             hits.extend(carve_text::scan_utmp(slice, self.now));
@@ -822,8 +672,15 @@ pub fn carve_stream<R: Read + Seek>(
     label: &str,
     live: &[TimelineEntry],
 ) -> Result<(Vec<TimelineEntry>, CarveStats)> {
-    let mut carver = Carver::new(volumes, options)?;
+    let carver = RefCell::new(Carver::new(volumes, options)?);
 
+    let size = if size == 0 {
+        reader
+            .seek(SeekFrom::End(0))
+            .map_err(|e| AllyError::io_with_context(e, format!("Sizing {} for carving", label)))?
+    } else {
+        size
+    };
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| AllyError::io_with_context(e, format!("Rewinding {} for carving", label)))?;
@@ -841,106 +698,50 @@ pub fn carve_stream<R: Read + Seek>(
         pb
     };
 
-    let mut buf = vec![0u8; BLOCK_SIZE + CARRY];
-    let mut carry = 0usize;
-    let mut block_start: u64 = 0; // absolute offset of buf[0]
-    let mut resume = 0usize; // first position of buf still to scan
-    let mut consecutive_errors = 0usize;
+    let mut src = DirectSource::new(reader, size, label.to_string());
+    let cfg = ScanConfig { block_size: BLOCK_SIZE, window: CARRY, step: STEP };
+    let signatures: [&[u8]; 2] = [FILE_MAGIC, INDX_MAGIC];
 
-    loop {
-        // Fill the block after the carried-over tail.
-        let mut filled = carry;
-        let mut eof = false;
-        while filled < carry + BLOCK_SIZE {
-            match reader.read(&mut buf[filled..carry + BLOCK_SIZE]) {
-                Ok(0) => {
-                    eof = true;
-                    break;
+    // The scanner hands over every aligned `FILE` / `INDX` signature with at least
+    // `CARRY` bytes behind it; what the validators accept is consumed in one go.
+    let mut on_hit = |_src: &mut dyn blockcarve::BlockSource, abs: u64, window: &[u8], which: usize| -> HitAction {
+        if which == 0 {
+            match file_record_size(window) {
+                Some(sz) => {
+                    carver.borrow_mut().on_file_record(&window[..sz], abs);
+                    HitAction::SkipTo(abs + sz as u64)
                 }
-                Ok(n) => {
-                    filled += n;
-                    consecutive_errors = 0;
+                None => HitAction::Continue,
+            }
+        } else {
+            match parse_indx_block(window) {
+                Some((sz, entries)) => {
+                    carver.borrow_mut().on_indx_block(entries, abs);
+                    HitAction::SkipTo(abs + sz as u64)
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    carver.stats.read_errors += 1;
-                    consecutive_errors += 1;
-                    let at = block_start + filled as u64;
-                    if carver.stats.read_errors <= 5 {
-                        eprintln!("[!] {}: read error at 0x{:X} while carving: {}; skipping {} bytes", label, at, e, BLOCK_SIZE);
-                    }
-                    if consecutive_errors > MAX_READ_ERRORS {
-                        eprintln!("[!] {}: too many consecutive read errors, carving stopped at 0x{:X}", label, at);
-                        eof = true;
-                        break;
-                    }
-                    // Skip the unreadable region and drop everything buffered.
-                    let next = at + BLOCK_SIZE as u64;
-                    if reader.seek(SeekFrom::Start(next)).is_err() {
-                        eof = true;
-                        break;
-                    }
-                    block_start = next;
-                    carry = 0;
-                    filled = 0;
-                    resume = 0;
-                }
+                None => HitAction::Continue,
             }
         }
-        if filled == 0 {
-            break;
-        }
-
-        let scan_end = if eof { filled } else { filled - CARRY };
-        // Log lines and utmp records: free space only. A line that starts
-        // before scan_end is whole in the buffer (lines are far shorter than
-        // the carry-over); the rest is seen on the next pass.
-        carver.scan_artifacts(&buf, scan_end, filled, block_start, resume);
-        let mut pos = resume;
-        while pos < scan_end {
-            let avail = &buf[pos..filled];
-            if avail.len() >= 4 {
-                match &avail[0..4] {
-                    b"FILE" => {
-                        if let Some(sz) = file_record_size(avail) {
-                            let abs = block_start + pos as u64;
-                            carver.on_file_record(&avail[..sz], abs);
-                            pos += sz;
-                            continue;
-                        }
-                    }
-                    b"INDX" => {
-                        if let Some((sz, entries)) = parse_indx_block(avail) {
-                            let abs = block_start + pos as u64;
-                            carver.on_indx_block(entries, abs);
-                            pos += sz;
-                            continue;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            pos += STEP;
-        }
-
-        carver.stats.bytes_scanned = block_start + scan_end as u64;
-        pb.set_position(carver.stats.bytes_scanned.min(size));
-        pb.set_message(format!(
-            "{} records, {} index entries",
-            carver.stats.file_records_new, carver.stats.indx_entries_new
-        ));
-
-        if eof {
-            break;
-        }
-        // Keep the tail so a structure that starts near the end is seen whole
-        // on the next pass; resume after anything already consumed.
-        buf.copy_within(scan_end..filled, 0);
-        carry = filled - scan_end;
-        resume = pos.saturating_sub(scan_end);
-        block_start += scan_end as u64;
-    }
+    };
+    // Log lines and utmp records: free space only, every byte offered once.
+    let mut on_block = |base: u64, block: &[u8]| carver.borrow_mut().scan_artifacts(base, block, false);
+    let mut on_progress = |offset: u64, _size: u64| {
+        let mut c = carver.borrow_mut();
+        c.stats.bytes_scanned = offset;
+        pb.set_position(offset.min(size));
+        pb.set_message(format!("{} records, {} index entries", c.stats.file_records_new, c.stats.indx_entries_new));
+    };
+    let stats = scan_many(&mut src, &cfg, &signatures, &mut on_hit, &mut on_progress, Some(&mut on_block));
     pb.finish_and_clear();
+
+    let mut carver = carver.into_inner();
+    carver.scan_artifacts(size, &[], true);
+    carver.stats.read_errors = stats.read_errors + stats.stalls;
+    if !options.quiet {
+        for note in stats.notes.iter().take(5) {
+            eprintln!("[!] {}", note);
+        }
+    }
 
     Ok(carver.finish(live))
 }
@@ -1017,5 +818,32 @@ mod tests {
         let mut b = vec![0u8; 4096];
         b[0..4].copy_from_slice(b"INDX");
         assert!(parse_indx_block(&b).is_none());
+    }
+
+    /// A blob with one valid `FILE` record and a syslog line in it: the record
+    /// comes back carved and the line is found in the (unknown, so free) space,
+    /// through the shared scanner.
+    #[test]
+    fn carves_a_record_and_a_log_line_from_a_blob() {
+        let mut blob = vec![0u8; 3 * 4096];
+        let mut r = vec![0u8; 1024];
+        r[0..4].copy_from_slice(b"FILE");
+        r[4..6].copy_from_slice(&48u16.to_le_bytes());
+        r[6..8].copy_from_slice(&3u16.to_le_bytes());
+        r[20..22].copy_from_slice(&56u16.to_le_bytes());
+        r[24..28].copy_from_slice(&100u32.to_le_bytes());
+        r[28..32].copy_from_slice(&1024u32.to_le_bytes());
+        r[48..50].copy_from_slice(&7u16.to_le_bytes());
+        r[510..512].copy_from_slice(&7u16.to_le_bytes());
+        r[1022..1024].copy_from_slice(&7u16.to_le_bytes());
+        blob[4096..5120].copy_from_slice(&r);
+        let line = b"\n2024-03-04T10:11:12.000000+00:00 host sshd[12]: Accepted publickey for root\n";
+        blob[8192..8192 + line.len()].copy_from_slice(line);
+        let mut reader = std::io::Cursor::new(blob);
+        let options = MftParseOptions::default();
+        let (rows, stats) = carve_stream(&mut reader, 0, &[], &options, "blob", &[]).unwrap();
+        assert_eq!(stats.file_records, 1);
+        assert_eq!(stats.text_lines, 1, "{rows:?}");
+        assert!(rows.iter().any(|e| e.file_name.contains("Accepted publickey")));
     }
 }

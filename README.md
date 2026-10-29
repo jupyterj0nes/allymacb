@@ -24,7 +24,7 @@ It started as a rewrite of [mftmactime](https://github.com/kero99/mftmactime) by
 | ext2 / ext3 / ext4 | partition inside an image, or a bare filesystem image | Read from the on-disk structures: inode numbers, ctime, deleted inodes, and with `--carve` the jbd2 journal. `ext4-view` as fallback. See limitations. |
 | Archives | `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.gz` | Streamed. Every `$MFT`, `$J` and bodyfile inside is parsed, one level of nested archives included. Archives with none of those are extracted and timelined from their modification times only. |
 | Directories | `-d` | KAPE, Velociraptor or UAC output, or a plain tree. Artifacts found inside are parsed; a tree with none is timelined from host metadata, with a warning. |
-| Raw sectors | `--carve`, never by default | NTFS `FILE` records and `$I30` index entries anywhere in an image or in an unrecognised file (pagefile, VSS store, old `$MFT` copy, `blkls` output); the ext4 journal; log lines and `utmp` records in free space. See [Carving](#carving). |
+| Raw sectors | `--carve`, never by default | NTFS `FILE` records and `$I30` index entries anywhere in an image or in an unrecognised file (pagefile, VSS store, old `$MFT` copy, `blkls` output); the ext4 journal; log lines and `utmp` records in free space. The block scanner and the record validators are the [blockcarve](https://github.com/jupyterj0nes/blockcarve) crate shared with masstin, faramir and caarea. See [Carving](#carving). |
 
 VHDX, sparse VMDK, dynamic VHD, QCOW and VDI are recognised by signature and refused with a clear error. Convert them to raw first.
 

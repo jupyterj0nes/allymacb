@@ -42,6 +42,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 name = "allymacb"
 version = "0.1.0"
 dependencies = [
+ "blockcarve",
  "byteorder",
  "chrono",
  "clap",
@@ -226,6 +227,14 @@ checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
  "zeroize",
+]
+
+[[package]]
+name = "blockcarve"
+version = "0.1.0"
+dependencies = [
+ "mft",
+ "walkdir",
 ]
 
 [[package]]
