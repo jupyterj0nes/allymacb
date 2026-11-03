@@ -289,10 +289,10 @@ fn cli_marks_significant_records_and_writes_the_hunt_csv() {
     assert!(touched.iter().all(|l| !l.contains("hunt")), "the verdict is in the tail, not in flags: {:?}", touched);
     // A copy with an older modification: tested, not significant; its medium
     // rule makes it a candidate and speaks first, the test's words follow.
-    let rule = "rule m_before_b (medium): modification before creation, rarity not measured";
+    let rule = "rule m_before_b (medium): modification before creation";
     assert!(stdout.lines().filter(|l| l.contains("/srv/copied")).all(|l| l.contains(",candidate,") && l.contains(&format!("{rule}; modification before creation"))), "{}", stdout);
     // Baseline copies: not judged by the hunt; the rule alone gives the state, 0 points.
-    assert!(stdout.lines().filter(|l| l.contains("/srv/base")).all(|l| l.ends_with(&format!(",candidate,0,\"{rule}\",,"))), "{}", stdout);
+    assert!(stdout.lines().filter(|l| l.contains("/srv/base")).all(|l| l.ends_with(&format!(",candidate,0,{rule},,"))), "{}", stdout);
     // Only masstin's six words in the hunt column.
     for l in stdout.lines().skip(1) {
         let hunt = l.rsplit(',').nth(4).unwrap_or("");
