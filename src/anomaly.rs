@@ -236,19 +236,25 @@ fn level(flag: &str, flags: &[&str]) -> Severity {
 }
 
 /// Records of the NTFS reference volume the rule rarities were measured on:
-/// the `$MFT` of the NIST Hacking Case (Windows XP, mostly stock files and
-/// two installers), one record per file.
-const MEASURED_ON: f64 = 12_183.0;
+/// the `$MFT` of a clean Windows Server 2016 lab host (PTR-SRV01, SQL Server
+/// Express and IIS, RangeForge, read from the live volume on 2026-11-03),
+/// one record per file, the 403 records of the collection itself left out.
+const MEASURED_ON: f64 = 431_153.0;
 
-/// Inodes of the Unix reference volume: a stock Ubuntu ext4 volume of a lab
-/// host acquired in October 2026 (`real_ext4.img`, 256 MB), one record per
-/// inode, read from the on-disk structures.
-const MEASURED_ON_EXT4: f64 = 861.0;
+/// USN records of the same host's `$UsnJrnl:$J` (37 MB allocated), the
+/// reference of the USN rules.
+const MEASURED_ON_USN: f64 = 273_208.0;
+
+/// Inodes of the Unix reference: the whole ext4 root of a clean Ubuntu 22.04
+/// lab host (LEO-LNX01, RangeForge, 2026-11-03), a bodyfile with birth times
+/// written by `stat` over `find / -xdev`, one record per inode.
+const MEASURED_ON_UNIX: f64 = 77_881.0;
 
 /// Points of a pattern that fired `hits` times on `records` reference
 /// records, the scale of the four tools: `10 · log10(records / hits)`. A
 /// pattern that never fired gets the bound the corpus gives, one in
-/// `records + 1` (41 on the NTFS reference, 29 on the ext4 one).
+/// `records + 1` (56 on the NTFS reference, 54 on the USN one, 49 on the
+/// Unix one).
 /// A rule measured below this many points fires on more than one clean
 /// record in ten: noise on that kind of record, it gives no state and no
 /// points, only its clause (the convention of the four tools).
@@ -260,33 +266,38 @@ fn rarity(hits: f64, records: f64) -> u32 {
 }
 
 /// `hunt_score` points of an indicator, masstin's scale measured, not
-/// chosen: `10 · log10(records / records that fire)` on the reference volume
-/// of the record's kind (NTFS: the NIST `$MFT`; Unix: the ext4 volume).
-/// `None` where it is not measured yet (the USN and carving rules, and the
-/// names on Unix).
+/// chosen: `10 · log10(records / records that fire)` on the reference of the
+/// record's kind (NTFS: the Server 2016 `$MFT`, its `$J` for the USN rule;
+/// Unix: the Ubuntu root). `None` where it is not measured yet (`backdated`,
+/// which needs carving, `m_before_b` on NTFS, and the names on Unix).
 ///
-/// | rule | NTFS, of 12,183 | points | ext4, of 861 | points |
+/// | rule | NTFS, of 431,153 | points | Unix, of 77,881 | points |
 /// |---|---|---|---|---|
-/// | `si_before_fn` | 324 | 16 | | |
-/// | `si_subsec_zero` | 236 | 17 | | |
-/// | `si_before_fn` with `si_subsec_zero` | 232 | 17 for the pair | | |
-/// | `b_after_c` | 220 | 17 | | |
-/// | `m_before_b` | | | 835 (package files keep their build mtime, older than the install's crtime) | 0 |
-/// | `future`, `pre_1980` | none | 41 | none | 29 |
-/// | names | none | 41 | | |
+/// | `si_before_fn` | 103,104 (files laid down from the install image keep the image's `$SI` times, the `$FN` ones are the install's) | 6, noise | | |
+/// | `si_subsec_zero` | 2,073 | 23 | | |
+/// | `si_before_fn` with `si_subsec_zero` | 2,061 | 23 for the pair | | |
+/// | `b_after_c` | 16,964 | 14 | | |
+/// | `usn_basic_info` | 6,520 of 273,208 USN records | 16 | | |
+/// | `m_before_b` | | | 71,982 (package files keep their build mtime, older than the install's crtime) | 0, noise |
+/// | `future`, `pre_1980` | none | 56 | none | 49 |
+/// | `m_after_c` | | | none | 49 |
+/// | names | none | 56 | | |
 fn points(flag: &str, ntfs: bool) -> Option<u32> {
     if !ntfs {
         let fired = match flag {
-            M_BEFORE_B => 835.0,
-            FUTURE | PRE_1980 => 0.0,
+            M_BEFORE_B => 71_982.0,
+            FUTURE | PRE_1980 | M_AFTER_C => 0.0,
             _ => return None,
         };
-        return Some(rarity(fired, MEASURED_ON_EXT4));
+        return Some(rarity(fired, MEASURED_ON_UNIX));
+    }
+    if flag == USN_BASIC_INFO {
+        return Some(rarity(6_520.0, MEASURED_ON_USN));
     }
     let fired = match flag {
-        SI_BEFORE_FN => 324.0,
-        SI_SUBSEC_ZERO => 236.0,
-        B_AFTER_C => 220.0,
+        SI_BEFORE_FN => 103_104.0,
+        SI_SUBSEC_ZERO => 2_073.0,
+        B_AFTER_C => 16_964.0,
         FUTURE | PRE_1980 | RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT => 0.0,
         _ => return None,
     };
@@ -294,8 +305,9 @@ fn points(flag: &str, ntfs: bool) -> Option<u32> {
 }
 
 /// Points of `$SI` before `$FN` with whole-second `$SI` times: measured as a
-/// pair (232 records), not the sum of the two.
-const PAIR_POINTS: u32 = 17;
+/// pair (2,061 records of 431,153), not the sum of the two. `si_before_fn`
+/// alone is noise on a modern Windows; the pair is not.
+const PAIR_POINTS: u32 = 23;
 
 /// What the rules of one record put in the tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,27 +416,36 @@ mod tests {
     #[test]
     fn rules_in_the_tail() {
         assert_eq!(Rules::of("", true), None);
+        // si_before_fn alone fires on 24 % of a clean Server 2016: noise, no level, no points, the clause.
         let r = Rules::of("WARN: si_before_fn", true).unwrap();
-        assert_eq!(r, Rules { severity: Some(Severity::Warn), points: 16, why: "rule si_before_fn (medium): $SI creation before the $FILE_NAME creation".into() });
+        assert_eq!(r, Rules { severity: None, points: 0, why: "rule si_before_fn (medium): $SI creation before the $FILE_NAME creation".into() });
+        let r = Rules::of("WARN: si_subsec_zero", true).unwrap();
+        assert_eq!((r.severity, r.points), (Some(Severity::Warn), 23));
         let r = Rules::of("ALERT: si_before_fn+si_subsec_zero", true).unwrap();
-        assert_eq!(r.severity, Some(Severity::Alert));
-        assert_eq!(r.points, 17, "the pair is measured as one pattern");
+        assert_eq!(r.severity, Some(Severity::Alert), "the pair is the timestomp signature and counts");
+        assert_eq!(r.points, 23, "the pair is measured as one pattern");
         assert!(r.why.starts_with("rule si_before_fn (high): ") && r.why.contains("; rule si_subsec_zero (high): "), "{}", r.why);
         // Strongest first; points add.
         let r = Rules::of("ALERT: b_after_c+future", true).unwrap();
-        assert_eq!(r.points, 17 + 41);
+        assert_eq!(r.points, 14 + 56);
         assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule b_after_c (medium): $SI creation after the record change time"), "{}", r.why);
         // Unix: m_before_b fires on 97 % of a stock ext4 volume: noise, no level, no points.
         let r = Rules::of("WARN: m_before_b", false).unwrap();
         assert_eq!(r, Rules { severity: None, points: 0, why: "rule m_before_b (medium): modification before creation".into() });
         let r = Rules::of("ALERT: m_before_b+future", false).unwrap();
-        assert_eq!((r.severity, r.points), (Some(Severity::Alert), 29), "the bound 861 inodes give; the noise adds nothing");
+        assert_eq!((r.severity, r.points), (Some(Severity::Alert), 49), "the bound 77,881 inodes give; the noise adds nothing");
         assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule m_before_b (medium): modification before creation"), "{}", r.why);
         assert_eq!(rarity(0.0, 12_183.0), 41);
         assert_eq!(rarity(1.0, 128.0), 21);
-        assert_eq!(rarity(835.0, 861.0), 0);
-        // Not measured: no points, and the clause says so.
+        assert_eq!(rarity(71_982.0, 77_881.0), 0);
+        assert_eq!(rarity(103_104.0, 431_153.0), 6);
+        assert_eq!(rarity(0.0, MEASURED_ON), 56);
+        // USN: measured on the journal of the same host.
         let r = Rules::of("ALERT: usn_basic_info", true).unwrap();
+        assert_eq!((r.severity, r.points), (Some(Severity::Alert), 16));
+        assert_eq!(Rules::of("ALERT: m_after_c", false).unwrap().points, 49, "never fired on the Unix root");
+        // Not measured: no points, and the clause says so.
+        let r = Rules::of("ALERT: backdated", true).unwrap();
         assert_eq!((r.severity, r.points), (Some(Severity::Alert), 0), "unmeasured is not noise: it keeps its level");
         assert!(r.why.ends_with(", rarity not measured"), "{}", r.why);
         assert_eq!(ids(&[B_AFTER_C, FUTURE]), "future (high)+b_after_c (medium)");

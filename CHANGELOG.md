@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Rule rarity measured on a modern Windows and a whole Linux root
+
+- **The NTFS reference is the `$MFT` of a clean Windows Server 2016 lab host** read from the live volume (431,153 records; the NIST Hacking Case `$MFT`, Windows XP, 12,183 records, was the previous one), with its `$UsnJrnl:$J` (273,208 records) for the USN rule; **the Unix reference is the whole ext4 root of a clean Ubuntu 22.04 lab host** (77,881 inodes, a bodyfile with birth times; a 256 MB image of 861 inodes before). What changed: `si_before_fn` alone fires on a quarter of a modern Windows (the install keeps the image's `$SI` times) and is noise there, 6 points, no state; the pair with `si_subsec_zero` stays the timestomp signature at 23; `b_after_c` 14; `usn_basic_info` is measured, 16; a pattern that never fired is worth 56 on NTFS, 54 on the journal and 49 on Unix (41 and 29 before); `m_after_c` is measured on Unix (never fired, 49). `backdated` and `m_before_b` on NTFS stay unmeasured.
+
 ### The timeline lines up with masstin's, column for column
 
 The CSV has masstin's 19 columns: 14 that describe the event, each in the position of the masstin column closest in meaning, then the five-column analysis tail the four tools share (masstin, caarea, faramir and allymacb), so their timelines read side by side and a case tool maps the tail once.

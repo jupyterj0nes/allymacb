@@ -445,7 +445,7 @@ mod tests {
         // Rules alone: a high rule gives `significant`, its measured points the score.
         assert_eq!(
             row,
-            "2024-01-01T00:00:00Z,srv01,,m...,carved,0,0,p2,1,-rw-r--r--,unallocated,\"4230,evil\",/etc/passwd,disk.E01:p2,significant,82,rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980,,"
+            "2024-01-01T00:00:00Z,srv01,,m...,carved,0,0,p2,1,-rw-r--r--,unallocated,\"4230,evil\",/etc/passwd,disk.E01:p2,significant,100,rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980,,"
         );
 
         // Test and rules: the stronger state, the scores add, the rules speak first.
@@ -453,8 +453,8 @@ mod tests {
         let row = format_csv_row(&e);
         assert!(row.ends_with(",significant,100,\"rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980; a, b; c\",,"), "{}", row);
         e.mark = Some(Arc::new(Mark { state: State::Candidate, score: Some(9), why: "c".into() }));
-        assert!(format_csv_row(&e).contains(",significant,91,rule future (high): "));
-        // A medium rule on a Unix record: m_before_b fires on 97 % of stock inodes, so it is noise
+        assert!(format_csv_row(&e).contains(",significant,100,rule future (high): "), "two never-fired rules already reach the cap");
+        // A medium rule on a Unix record: m_before_b fires on 92 % of stock inodes, so it is noise
         // there: the test's state and score stand, the clause stays.
         let mut u = e.clone().with_source(source::EXT4);
         u.flags = "WARN: m_before_b".into();

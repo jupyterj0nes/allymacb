@@ -111,10 +111,10 @@ time_created,host,action,type,source,uid,gid,volume,size,mode,deleted,meta,file_
 2024-02-03T09:12:41Z,,,macb,carved,0,0,p2,1024,-/-rwxrwxrwx,unallocated,34567,C:\Windows\System32\cmd.exe (carved @0x1A2B3C00),disk.E01:p2,,,,,
 2026-09-23T23:05:14Z,uac-server02,,.a..,ext4,0,0,p1,1261,drwxr-xr-x,dtime,1572998,/boot/grub2/datetime.mod,uac-server02.tar.gz:disk.img:p1,,,,,
 2026-09-24T18:42:22Z,,created,....,usn,0,0,C:,4096,-/-rwxrwxrwx,,45120,C:\Windows\Temp\payload.exe (USN: FILE_CREATE+CLOSE),$J,significant,17,$SI creation before the $FILE_NAME creation; creation time in whole seconds,,
-2001-01-01T00:00:00Z,,,macb,mft,0,0,C:,4096,-/-rwxrwxrwx,,45120,C:\Windows\Temp\payload.exe,$MFT,significant,34,"rule si_before_fn (high): $SI creation before the $FILE_NAME creation; rule si_subsec_zero (high): $SI times in whole seconds, the $FILE_NAME ones not; $SI creation before the $FILE_NAME creation; creation time in whole seconds",,
+2001-01-01T00:00:00Z,,,macb,mft,0,0,C:,4096,-/-rwxrwxrwx,,45120,C:\Windows\Temp\payload.exe,$MFT,significant,40,"rule si_before_fn (high): $SI creation before the $FILE_NAME creation; rule si_subsec_zero (high): $SI times in whole seconds, the $FILE_NAME ones not; $SI creation before the $FILE_NAME creation; creation time in whole seconds",,
 ```
 
-The last two rows come from a run with `--investigation-from`. The last one has both voices: its rules (17 points, measured) and the statistical hunt (17 points) add up to 34. Without `--investigation-from`, a row with rules carries the state they give and their points; a row without any is left with an empty tail. The first row shows a rule measured common on its kind of record (`m_before_b` on Unix, see Hunting): it gives no state and no points, only its clause.
+The last two rows come from a run with `--investigation-from`. The last one has both voices: its rules (23 points, measured) and the statistical hunt (17 points) add up to 40. Without `--investigation-from`, a row with rules carries the state they give and their points; a row without any is left with an empty tail. The first row shows a rule measured common on its kind of record (`m_before_b` on Unix, see Hunting): it gives no state and no points, only its clause.
 
 The 19 columns are those of [masstin's timeline](https://github.com/jupyterj0nes/masstin/blob/main/docs/csv-format.md), each in the position of the masstin column closest in meaning, so a timeline of each read side by side keeps the same kind of value in the same column:
 
@@ -165,26 +165,27 @@ These are allymacb's static rules: a known pattern, with no probability behind i
 
 * **Level.** An indicator is `high` when it has no ordinary explanation, and so is the pair `si_before_fn` with `si_subsec_zero` (the classic timestomp signature); the patterns that installers and preserved-timestamp copies also produce are `medium`. A high rule puts `significant` in `hunt`, a medium one `candidate`; a stronger statistical state keeps its place. A rule measured below 10 points on the record's kind (it fires on more than one clean record in ten) is noise there: no state, no points, the clause only. The level is the author's opinion; the measurement decides.
 * **`hunt_why`** has one clause per indicator, `rule <id> (<level>): <what it means>`, strongest first, before the hunt's own words.
-* **`hunt_score`** gets the rule's rarity on masstin's scale, measured, not chosen: `10 · log10(records / records that fire)` on a reference volume of the record's kind: for NTFS the `$MFT` of the NIST Hacking Case (12,183 file records of a Windows XP install, nearly all stock files and two setup programs); for Unix records a stock Ubuntu ext4 volume of a lab host (861 inodes, read from the on-disk structures). A pattern that never fired on the reference is not "never": it gets the bound the volume gives, one in `records + 1` (41 on the NTFS reference, 29 on the ext4 one). A rule not measured yet adds 0 and its clause ends with `rarity not measured`. Test and rules add, capped at 100.
+* **`hunt_score`** gets the rule's rarity on masstin's scale, measured, not chosen: `10 · log10(records / records that fire)` on a reference volume of the record's kind: for NTFS the `$MFT` of a clean Windows Server 2016 lab host read from the live volume (431,153 file records, SQL Server Express and IIS installed, nothing planted), and its `$UsnJrnl:$J` (273,208 records) for the USN rule; for Unix records the whole ext4 root of a clean Ubuntu 22.04 lab host (77,881 inodes, a bodyfile with birth times). A pattern that never fired on the reference is not "never": it gets the bound the volume gives, one in `records + 1` (56 on the NTFS reference, 54 on the journal, 49 on the Unix root). A rule not measured yet adds 0 and its clause ends with `rarity not measured`. Test and rules add, capped at 100.
 
 | Rule | Level | Fired on | Points |
 |---|---|---|---|
-| `si_before_fn` | medium (high with `si_subsec_zero`) | 324 of 12,183 | 16 |
-| `si_subsec_zero` | medium (high with `si_before_fn`) | 236 of 12,183 | 17 |
-| `si_before_fn` with `si_subsec_zero` | high | 232 of 12,183 | 17 for the pair, not the sum |
-| `b_after_c` | medium | 220 of 12,183 | 17 |
-| `future`, `pre_1980`, `rtlo_name`, `invisible_name`, `double_ext` | high | none of 12,183 | 41: one in 12,184 or rarer |
-| `m_before_b` on a Unix record | medium | 835 of 861 (package files keep their build mtime, older than the install's crtime) | 0 |
-| `future`, `pre_1980` on a Unix record | high | none of 861 | 29: one in 862 or rarer |
-| `m_after_c` (high) | | Unix only | not measured, 0 |
-| `usn_basic_info` (high), `backdated` (high) | | no journal or carving on the reference | not measured, 0 |
+| `si_before_fn` | medium (high with `si_subsec_zero`) | 103,104 of 431,153: files laid down from the install image keep the image's `$SI` times while their `$FILE_NAME` times are the install's | 6: noise, no state, no points |
+| `si_subsec_zero` | medium (high with `si_before_fn`) | 2,073 of 431,153 | 23 |
+| `si_before_fn` with `si_subsec_zero` | high | 2,061 of 431,153 | 23 for the pair, not the sum |
+| `b_after_c` | medium | 16,964 of 431,153 | 14 |
+| `usn_basic_info` | high | 6,520 of 273,208 USN records | 16 |
+| `future`, `pre_1980`, `rtlo_name`, `invisible_name`, `double_ext` | high | none of 431,153 | 56: one in 431,154 or rarer |
+| `m_before_b` on a Unix record | medium | 71,982 of 77,881 (package files keep their build mtime, older than the install's crtime) | 0: noise |
+| `future`, `pre_1980`, `m_after_c` on a Unix record | high | none of 77,881 | 49: one in 77,882 or rarer |
+| `backdated` (high) | | no carving on the reference | not measured, 0 |
+| `m_before_b` on an NTFS record | | | not measured, 0 |
 
-NTFS records use the NTFS rarities; ext4, bodyfile and directory-walk records the ext4 ones. The measurement is what makes `m_before_b` worth nothing on Unix: on a stock Ubuntu volume nearly every file has a modification time older than its creation, because packages ship files with the mtime of their build. The rule still fires and still says so in `hunt_why`; it adds no points. A larger clean Linux volume, measured the same way, would tighten the bound of `future` and `pre_1980`.
+NTFS records use the NTFS rarities; ext4, bodyfile and directory-walk records the Unix ones. The measurement is what makes `m_before_b` worth nothing on Unix: on a stock Ubuntu root nearly every file has a modification time older than its creation, because packages ship files with the mtime of their build. The same measurement makes `si_before_fn` alone worth nothing on a modern Windows: a quarter of the files of a clean Server 2016 have `$SI` times older than their `$FILE_NAME` ones, because the install lays them down with the times of the image. Both rules still fire and still say so in `hunt_why`; they add no points and no state. The pair with `si_subsec_zero` is another matter: 2,061 records in 431,153, the timestomp signature, 23 points and `significant`. On the Windows XP `$MFT` of the NIST Hacking Case, the previous reference, `si_before_fn` fired on 324 of 12,183 records and was worth 16: what a rule is worth depends on the generation of Windows it meets, and the table follows the modern one.
 
 ```csv
-1975-06-15T12:00:00Z,,,ma..,ext4,0,0,p1,100,-rw-r--r--,,133,/docs/ts1975.txt,ext4.img:p1,significant,29,"rule pre_1980 (high): a timestamp before 1980; rule m_before_b (medium): modification before creation",,
-1999-02-07T07:08:08Z,,,m..b,mft,0,0,C:,78706,-/-rwxrwxrwx,,9854,C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\40\BIN\FPEXT.MSG,nist-hacking-case.mft,significant,17,"rule si_before_fn (high): $SI creation before the $FILE_NAME creation; rule si_subsec_zero (high): $SI times in whole seconds, the $FILE_NAME ones not",,
-2000-11-18T12:28:36Z,,,m..b,mft,0,0,C:,450669,-/-rwxrwxrwx,,9852,C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\40\BIN\FP4AWEC.DLL,nist-hacking-case.mft,candidate,17,"rule si_subsec_zero (medium): $SI times in whole seconds, the $FILE_NAME ones not",,
+1975-06-15T12:00:00Z,,,ma..,ext4,0,0,p1,100,-rw-r--r--,,133,/docs/ts1975.txt,ext4.img:p1,significant,49,"rule pre_1980 (high): a timestamp before 1980; rule m_before_b (medium): modification before creation",,
+1999-02-07T07:08:08Z,,,m..b,mft,0,0,C:,78706,-/-rwxrwxrwx,,9854,C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\40\BIN\FPEXT.MSG,nist-hacking-case.mft,significant,23,"rule si_before_fn (high): $SI creation before the $FILE_NAME creation; rule si_subsec_zero (high): $SI times in whole seconds, the $FILE_NAME ones not",,
+2000-11-18T12:28:36Z,,,m..b,mft,0,0,C:,450669,-/-rwxrwxrwx,,9852,C:\Program Files\Common Files\Microsoft Shared\Web Server Extensions\40\BIN\FP4AWEC.DLL,nist-hacking-case.mft,candidate,23,"rule si_subsec_zero (medium): $SI times in whole seconds, the $FILE_NAME ones not",,
 ```
 
 At the end of every run, quiet or not, stderr lists each file with a high rule on its own line (up to 40, then a count) and sums up the medium ones:
