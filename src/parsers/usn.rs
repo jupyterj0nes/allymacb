@@ -9,7 +9,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::timefmt::{filetime_to_datetime, format_utc_iso};
 use crate::anomaly;
-use crate::timeline::{source, TimelineEntry};
+use crate::hunt;
+use crate::timeline::{action, deleted, source, TimelineEntry};
 
 /// Parent-directory path cache: MFT entry number -> (full directory path, size).
 /// When present, the directory path of the record's *parent* reference is
@@ -79,6 +80,25 @@ pub fn decode_usn_reason(reason: u32) -> String {
         format!("0x{:08X}", reason)
     } else {
         out
+    }
+}
+
+/// The `action` column of a USN record: the strongest change its reasons
+/// name. Deletion first (a file created and deleted in one record is gone),
+/// then creation, rename, data and metadata; empty for a bare `CLOSE`.
+pub fn usn_action(reason: u32) -> &'static str {
+    if reason & 0x0000_0200 != 0 {
+        action::DELETED
+    } else if reason & 0x0000_0100 != 0 {
+        action::CREATED
+    } else if reason & 0x0000_3000 != 0 {
+        action::RENAMED
+    } else if reason & 0x0000_0077 != 0 {
+        action::MODIFIED
+    } else if reason & 0x01FF_C800 != 0 || reason & 0x0000_0400 != 0 {
+        action::METADATA
+    } else {
+        ""
     }
 }
 
@@ -179,6 +199,7 @@ pub fn parse_usn_reader_with_report<R: Read + Seek>(
     let mut timeline = Vec::new();
     let mut report = UsnParseReport::default();
     let drive_prefix = options.drive_letter.unwrap_or('C');
+    let volume = hunt::new_volume();
 
     let pb = if !options.quiet && total_size > 0 {
         let pb = ProgressBar::new(total_size);
@@ -338,7 +359,10 @@ pub fn parse_usn_reader_with_report<R: Read + Seek>(
                 display_name,
             )
             .with_source(source::USN)
-            .with_flags(anomaly::column(&[anomaly::usn_flags(fixed.reason), anomaly::name_flags(&file_name)].concat())));
+            .with_action(usn_action(fixed.reason))
+            .with_deleted(if fixed.reason & 0x0000_0200 != 0 { deleted::USN } else { "" })
+            .with_flags(anomaly::column(&[anomaly::usn_flags(fixed.reason), anomaly::name_flags(&file_name)].concat()))
+            .with_hunt(Some(hunt::record(volume, hunt::Evidence::Usn { entry: entry_id, seq: fixed.sequence, reason: fixed.reason, time: (secs, nanos) }))));
             report.records_parsed += 1;
         } else {
             report.records_no_timestamp += 1;
@@ -380,4 +404,22 @@ pub fn parse_usn_file_with_report(
     let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let reader = BufReader::new(file);
     parse_usn_reader_with_report(reader, total_size, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_is_the_strongest_change_of_the_record() {
+        assert_eq!(usn_action(0x0000_0100 | 0x8000_0000), action::CREATED);
+        assert_eq!(usn_action(0x0000_0100 | 0x0000_0200), action::DELETED, "created and deleted in one record: gone");
+        assert_eq!(usn_action(0x0000_1000), action::RENAMED);
+        assert_eq!(usn_action(0x0000_2000 | 0x8000_0000), action::RENAMED);
+        assert_eq!(usn_action(0x0000_0002), action::MODIFIED);
+        assert_eq!(usn_action(0x0000_0020), action::MODIFIED, "named stream data");
+        assert_eq!(usn_action(0x0000_8000), action::METADATA, "BASIC_INFO_CHANGE: timestamps or attributes");
+        assert_eq!(usn_action(0x0000_0800), action::METADATA);
+        assert_eq!(usn_action(0x8000_0000), "", "a bare CLOSE says nothing");
+    }
 }

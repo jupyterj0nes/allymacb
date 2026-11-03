@@ -15,10 +15,9 @@ import sys
 from collections import defaultdict
 
 
-def flag_list(column):
-    """Indicators of a flags column value ('ALERT: a+b' / 'WARN: a' / '')."""
-    body = column.split(': ', 1)[1] if ': ' in column else column
-    return [x for x in body.split('+') if x]
+def flag_list(why):
+    """Rule ids of a hunt_why value: each rule clause begins 'rule <id> (high|medium): '."""
+    return re.findall(r'(?:^|; )rule (\w+) \((?:high|medium)\): ', why)
 
 
 def iso_secs(s):
@@ -33,12 +32,10 @@ def check(truth_path, csv_path, kind):
     deleted = set(truth['deleted'])
     out = [f'    rows {len(rows)}, sources {sorted({r["source"] for r in rows})}']
 
-    tag = re.compile(r' \((deleted|carved @0x[0-9A-F]+)\)')
+    tag = re.compile(r' \(carved @0x[0-9A-F]+\)')
 
     def norm(name):
-        # "[uac-host-linux] /docs/x", "/docs/x (deleted)", "/docs/x (carved @0x...)"
-        if name.startswith('['):
-            name = name.split('] ', 1)[1]
+        # "/docs/x", "/docs/x (carved @0x...)"; the host and the deletion are columns of their own
         return tag.sub('', name)
 
     by_path = defaultdict(list)
@@ -75,7 +72,7 @@ def check(truth_path, csv_path, kind):
         out.append('        missing ' + p)
 
     # Deleted files on the image: the inode may still be in the table (rows
-    # tagged "(deleted)", named through the journal) or only in the journal
+    # with the deleted column set, named through the journal) or only in the journal
     # (carved rows with the pre-deletion state).
     if kind == 'ext4':
         gone = [f for f in truth['populated'] if in_deleted(f['path']) and not f['dir']]
@@ -98,7 +95,7 @@ def check(truth_path, csv_path, kind):
         rs = by_path.get(p, [])
         got = set()
         for r in rs:
-            got.update(x for x in flag_list(r['flags']))
+            got.update(x for x in flag_list(r['hunt_why']))
         want = set(want)
         if kind == 'ext4':
             want.discard('m_after_c')   # ext4-view exposes no ctime
@@ -112,7 +109,7 @@ def check(truth_path, csv_path, kind):
     noisy = defaultdict(int)
     for p in clean:
         for r in by_path.get(p, []):
-            for x in flag_list(r['flags']):
+            for x in flag_list(r['hunt_why']):
                 noisy[x] += 1
     out.append(f'    indicators on files that should be clean: {dict(noisy) or "none"}')
     # mode rendering

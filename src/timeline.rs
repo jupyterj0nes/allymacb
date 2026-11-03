@@ -1,8 +1,11 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::{AllyError, ErrorCode, Result};
+use crate::anomaly::{Rules, Severity};
+use crate::hunt::{HuntRecord, Mark, State, SCORE_MAX};
 
 /// Values of the `source` column: which kind of evidence a row was built from.
 pub mod source {
@@ -24,6 +27,32 @@ pub mod source {
     pub const UNKNOWN: &str = "unknown";
 }
 
+/// Values of the `action` column: what happened to the file, when the
+/// evidence says it outright. Only USN records do so far; MACB rows leave it
+/// empty.
+pub mod action {
+    pub const CREATED: &str = "created";
+    pub const DELETED: &str = "deleted";
+    pub const RENAMED: &str = "renamed";
+    /// Data written, extended or truncated.
+    pub const MODIFIED: &str = "modified";
+    /// Timestamps, attributes, security, links, streams: everything but data
+    /// and name.
+    pub const METADATA: &str = "metadata";
+}
+
+/// Values of the `deleted` column: how the file is known to be deleted.
+/// Empty for a file that is not.
+pub mod deleted {
+    /// NTFS record not in use (live `$MFT` or carved), or ext4 inode with no
+    /// links left.
+    pub const UNALLOCATED: &str = "unallocated";
+    /// ext4 inode with a deletion time.
+    pub const DTIME: &str = "dtime";
+    /// USN record with `FILE_DELETE`.
+    pub const USN: &str = "usn";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub timestamp: String,
@@ -38,8 +67,27 @@ pub struct TimelineEntry {
     pub file_name: String,
     /// One of the constants in [`source`].
     pub source: &'static str,
-    /// Anti-forensics indicators from [`crate::anomaly`], `+`-joined; usually empty.
+    /// Collection the row came from (bodyfile or archive name, usually the
+    /// host's), when there is one.
+    pub host: Option<Arc<str>>,
+    /// One of the constants in [`action`], or empty.
+    pub action: &'static str,
+    /// Volume of the file: drive letter of a loose `$MFT` or `$J`, partition
+    /// of an image (`p2`).
+    pub volume: Option<Arc<str>>,
+    /// One of the constants in [`deleted`], or empty.
+    pub deleted: &'static str,
+    /// The input the row was read from, outermost first: `disk.E01:p2:$MFT`.
+    pub evidence: Option<Arc<str>>,
+    /// Anti-forensics indicators from [`crate::anomaly`] (`ALERT: a+b`,
+    /// `WARN: a`); usually empty. Written in the analysis tail.
     pub flags: String,
+    /// The record this row was built from, shared by all its rows, for
+    /// `--investigation-from` (see [`crate::hunt`]). Not written to the CSV.
+    pub hunt: Option<Arc<HuntRecord>>,
+    /// The hunt's verdict on that record, written in the analysis tail.
+    /// None when the hunt did not run or the row did not enter it.
+    pub mark: Option<Arc<Mark>>,
 }
 
 impl TimelineEntry {
@@ -67,7 +115,14 @@ impl TimelineEntry {
             meta,
             file_name,
             source: source::UNKNOWN,
+            host: None,
+            action: "",
+            volume: None,
+            deleted: "",
+            evidence: None,
             flags: String::new(),
+            hunt: None,
+            mark: None,
         }
     }
 
@@ -77,9 +132,27 @@ impl TimelineEntry {
         self
     }
 
-    /// Sets the `flags` column (see [`crate::anomaly`]).
+    /// Sets the rule indicators (see [`crate::anomaly`]).
     pub fn with_flags(mut self, flags: String) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Sets the `action` column (see [`action`]).
+    pub fn with_action(mut self, action: &'static str) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// Sets the `deleted` column (see [`deleted`]).
+    pub fn with_deleted(mut self, deleted: &'static str) -> Self {
+        self.deleted = deleted;
+        self
+    }
+
+    /// Links the row to the record it was built from (see [`crate::hunt`]).
+    pub fn with_hunt(mut self, record: Option<Arc<HuntRecord>>) -> Self {
+        self.hunt = record;
         self
     }
 }
@@ -139,14 +212,89 @@ pub fn escape_csv_text(val: &str) -> String {
 /// row format in [`TimelineWriter::write_entries`]. Tests reference this constant so the
 /// header cannot drift between the writer and its assertions.
 ///
-/// `time_created` is the timestamp of the MACB event each row represents.
-/// `source` says what kind of evidence the row comes from (see [`source`]);
-/// rows recovered by `--carve` say `carved`. `flags` lists anti-forensics
-/// indicators (see [`crate::anomaly`]) and is empty on most rows.
-pub const CSV_HEADER: &str = "time_created,size,type,mode,uid,gid,meta,file_name,source,flags";
+/// The layout follows masstin's timeline, column for column: 14 that
+/// describe the event, each in the position of masstin's column with the
+/// closest meaning (`host` where masstin has `dst_computer`, `action` for
+/// `event_type`, `type` for `event_id`, `meta` for `logon_id`, `file_name`
+/// for `detail`, `evidence` for `log_filename`), then masstin's analysis
+/// tail. `time_created` is the timestamp of the MACB event each row
+/// represents; `source` says what kind of evidence it comes from (see
+/// [`source`]).
+///
+/// The tail holds every verdict on the row's record, in the convention the
+/// four tools share (masstin's `docs/csv-format.md`): `hunt` (one of
+/// masstin's six states, see [`hunt_word`]), `hunt_score` (how rare the
+/// record is, 0 to 100: the statistical hunt's `-10 · log10(q)` plus the
+/// measured rarity of its rules, capped at 100) and `hunt_why` (one clause
+/// per rule, `rule <id> (<level>): ...`, strongest first, then the hunt's
+/// reasons in words). `verdict` and `notes` are the analyst's and are
+/// written empty.
+pub const CSV_HEADER: &str = "time_created,host,action,type,source,uid,gid,volume,size,mode,deleted,meta,file_name,evidence,hunt,hunt_score,hunt_why,verdict,notes";
 
 /// Number of columns in [`CSV_HEADER`].
-pub const CSV_COLUMNS: usize = 10;
+pub const CSV_COLUMNS: usize = 19;
+
+/// The rules of a row's record, rarity measured on NTFS records only.
+fn rules(entry: &TimelineEntry) -> Option<Rules> {
+    let ntfs = matches!(entry.source, source::MFT | source::USN | source::CARVED);
+    Rules::of(&entry.flags, ntfs)
+}
+
+/// The state a rule level gives: a high rule (`ALERT`) `significant`, a
+/// medium one (`WARN`) `candidate`.
+fn rule_state(severity: Severity) -> State {
+    match severity {
+        Severity::Alert => State::Significant,
+        Severity::Warn => State::Candidate,
+    }
+}
+
+/// The `hunt` column: the stronger of the statistical state and the state
+/// the rules give (`significant` over `candidate` over the rest). Only
+/// masstin's six words ever go in it.
+pub fn hunt_word(entry: &TimelineEntry) -> &'static str {
+    let state = entry.mark.as_ref().map(|m| m.state);
+    let rule = rules(entry).map(|r| rule_state(r.severity));
+    strongest(state, rule).map(State::as_str).unwrap_or("")
+}
+
+fn strongest(state: Option<State>, rule: Option<State>) -> Option<State> {
+    for s in [State::Significant, State::Candidate] {
+        if state == Some(s) || rule == Some(s) {
+            return Some(s);
+        }
+    }
+    state.or(rule)
+}
+
+/// The analysis tail of a row with no verdict, written bare as masstin does.
+const EMPTY_TAIL: &str = ",,,,,";
+
+fn tail(entry: &TimelineEntry) -> String {
+    let mark = entry.mark.as_deref();
+    let rules = rules(entry);
+    let Some(state) = strongest(mark.map(|m| m.state), rules.as_ref().map(|r| rule_state(r.severity))) else {
+        return EMPTY_TAIL.to_string();
+    };
+    // Test and rules add, capped at masstin's top.
+    let score = match (mark.and_then(|m| m.score), &rules) {
+        (s, Some(r)) => Some((u32::from(s.unwrap_or(0)) + r.points).min(u32::from(SCORE_MAX))),
+        (s, None) => s.map(u32::from),
+    };
+    let score = score.map(|s| s.to_string()).unwrap_or_default();
+    let test = mark.map(|m| m.why.as_str()).filter(|w| !w.is_empty());
+    let why = match (rules.map(|r| r.why), test) {
+        (Some(r), Some(t)) => format!("{}; {}", r, t),
+        (Some(r), None) => r,
+        (None, Some(t)) => t.to_string(),
+        (None, None) => String::new(),
+    };
+    format!(",{},{},{},,", state.as_str(), score, escape_csv_text(&why))
+}
+
+fn opt(v: &Option<Arc<str>>) -> &str {
+    v.as_deref().unwrap_or("")
+}
 
 /// Formats one timeline entry as a CSV row (without trailing newline).
 /// Every column is escaped: `meta` and `file_name` carry evidence-controlled
@@ -154,17 +302,22 @@ pub const CSV_COLUMNS: usize = 10;
 /// shift columns.
 pub fn format_csv_row(entry: &TimelineEntry) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}{}",
         escape_csv(&entry.timestamp),
-        entry.size,
+        escape_csv_text(opt(&entry.host)),
+        entry.action,
         escape_csv(&entry.macb),
-        escape_csv(&entry.mode),
+        entry.source,
         entry.uid,
         entry.gid,
+        escape_csv_text(opt(&entry.volume)),
+        entry.size,
+        escape_csv(&entry.mode),
+        entry.deleted,
         escape_csv_text(&entry.meta),
         escape_csv_text(&entry.file_name),
-        entry.source,
-        escape_csv(&entry.flags)
+        escape_csv_text(opt(&entry.evidence)),
+        tail(entry)
     )
 }
 
@@ -181,6 +334,7 @@ impl TimelineWriter {
             a.timestamp_secs
                 .cmp(&b.timestamp_secs)
                 .then_with(|| a.timestamp_nanos.cmp(&b.timestamp_nanos))
+                .then_with(|| a.host.cmp(&b.host))
                 .then_with(|| a.file_name.cmp(&b.file_name))
         });
 
@@ -277,8 +431,40 @@ mod tests {
         );
         let row = format_csv_row(&e);
         // The injected comma in meta must stay inside one quoted cell.
-        assert_eq!(row, "2024-01-01T00:00:00Z,1,m...,-rw-r--r--,0,0,\"4230,evil\",/etc/passwd,unknown,");
-        let row = format_csv_row(&e.with_source(source::CARVED).with_flags("future+pre_1980".into()));
-        assert!(row.ends_with(",carved,future+pre_1980"));
+        assert_eq!(row, "2024-01-01T00:00:00Z,,,m...,unknown,0,0,,1,-rw-r--r--,,\"4230,evil\",/etc/passwd,,,,,,");
+        assert_eq!(row.matches(',').count(), CSV_COLUMNS, "18 separators plus the one inside the quoted meta");
+
+        let mut e = e.with_source(source::CARVED).with_flags("ALERT: future+pre_1980".into()).with_deleted(deleted::UNALLOCATED);
+        e.host = Some("srv01".into());
+        e.volume = Some("p2".into());
+        e.evidence = Some("disk.E01:p2".into());
+        let row = format_csv_row(&e);
+        // Rules alone: a high rule gives `significant`, its measured points the score.
+        assert_eq!(
+            row,
+            "2024-01-01T00:00:00Z,srv01,,m...,carved,0,0,p2,1,-rw-r--r--,unallocated,\"4230,evil\",/etc/passwd,disk.E01:p2,significant,82,rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980,,"
+        );
+
+        // Test and rules: the stronger state, the scores add, the rules speak first.
+        e.mark = Some(Arc::new(Mark { state: State::Significant, score: Some(22), why: "a, b; c".into() }));
+        let row = format_csv_row(&e);
+        assert!(row.ends_with(",significant,100,\"rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980; a, b; c\",,"), "{}", row);
+        e.mark = Some(Arc::new(Mark { state: State::Candidate, score: Some(9), why: "c".into() }));
+        assert!(format_csv_row(&e).contains(",significant,91,rule future (high): "));
+        // A medium rule on a Unix record: candidate, not measured, 0 points.
+        let mut u = e.clone().with_source(source::EXT4);
+        u.flags = "WARN: m_before_b".into();
+        assert!(format_csv_row(&u).ends_with(",candidate,9,\"rule m_before_b (medium): modification before creation, rarity not measured; c\",,"), "{}", format_csv_row(&u));
+        u.mark = Some(Arc::new(Mark { state: State::Habitual, score: Some(0), why: String::new() }));
+        assert!(format_csv_row(&u).ends_with(",candidate,0,\"rule m_before_b (medium): modification before creation, rarity not measured\",,"));
+        u.mark = None;
+        assert!(format_csv_row(&u).ends_with(",candidate,0,\"rule m_before_b (medium): modification before creation, rarity not measured\",,"));
+        // The test alone.
+        e.flags.clear();
+        assert!(format_csv_row(&e).ends_with(",candidate,9,c,,"));
+        e.mark = Some(Arc::new(Mark { state: State::Habitual, score: Some(0), why: String::new() }));
+        assert!(format_csv_row(&e).ends_with(",habitual,0,,,"));
+        e.mark = Some(Arc::new(Mark { state: State::Baseline, score: None, why: String::new() }));
+        assert!(format_csv_row(&e).ends_with(",baseline,,,,"));
     }
 }

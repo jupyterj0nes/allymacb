@@ -55,7 +55,8 @@ fn test_bodyfile_parser_full_macb() {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].macb, "macb");
-    assert_eq!(entries[0].file_name, "[my_host] /usr/bin/bash");
+    assert_eq!(entries[0].file_name, "/usr/bin/bash");
+    assert_eq!(entries[0].host.as_deref(), Some("my_host"));
     assert_eq!(entries[0].mode, "-rwxr-xr-x");
     assert_eq!(entries[0].size, 1024);
     assert_eq!(entries[0].meta, "1234");
@@ -113,7 +114,7 @@ fn test_csv_timeline_writer_sorting_and_escaping() {
 
     assert_eq!(lines[0], CSV_HEADER);
     // Line 1 should be the older file (2020)
-    assert!(lines[1].starts_with("2020-01-01T00:00:00Z,100,m..."));
+    assert!(lines[1].starts_with("2020-01-01T00:00:00Z,,,m...,unknown,0,0,,100,"));
     // Line 2 should be the newer file (2026) and properly escaped with quotes
     assert!(lines[2].contains("\"file,with,comma.txt\""));
 

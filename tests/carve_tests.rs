@@ -208,7 +208,7 @@ fn live_mft_records_are_not_reported_as_carved() {
     let mut blob = junk(1024 * 1024, 4);
     place(&mut blob, 0x1_0000, &mft);
     place(&mut blob, 0x8_0000, &older);
-    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: Some(mft_path), free_ranges: vec![], free_known: false };
+    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: Some(mft_path), free_ranges: vec![], free_known: false, hunt_volume: None, label: None };
     let (rows, stats) = carve_stream(&mut Cursor::new(&blob), blob.len() as u64, &[vol], &opts(true), "img", &[]).unwrap();
     assert_eq!(stats.file_records, 9);
     assert_eq!(stats.file_records_new, 1, "only the older state is new");
@@ -252,7 +252,7 @@ fn indx_slack_entries_of_deleted_files_are_recovered() {
     assert_eq!(size, 4096);
     assert_eq!(entries.len(), 2);
 
-    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: Some(mft_path), free_ranges: vec![], free_known: false };
+    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: Some(mft_path), free_ranges: vec![], free_known: false, hunt_volume: None, label: None };
     let (rows, stats) = carve_stream(&mut Cursor::new(&blob), blob.len() as u64, &[vol], &opts(false), "img", &[]).unwrap();
     assert_eq!(stats.indx_blocks, 1);
     assert_eq!(stats.indx_entries, 2);
@@ -330,7 +330,7 @@ fn log_lines_and_utmp_records_are_carved_from_free_space_only() {
     assert_eq!(sudo.source, source::CARVED);
 
     // A volume covering the blob whose free space is only 0x10000..0x20000.
-    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: None, free_ranges: vec![(0x1_0000, 0x1_0000)], free_known: true };
+    let vol = VolumeContext { start: 0, end: blob.len() as u64, live_mft: None, free_ranges: vec![(0x1_0000, 0x1_0000)], free_known: true, hunt_volume: None, label: None };
     let (rows, stats) = carve_stream(&mut Cursor::new(&blob), blob.len() as u64, &[vol], &opts(false), "img", &[]).unwrap();
     assert_eq!(stats.text_lines, 2);
     assert_eq!(stats.utmp_records, 1);

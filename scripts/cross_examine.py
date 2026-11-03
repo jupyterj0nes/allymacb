@@ -39,16 +39,28 @@ def run(args, name, extra=()):
         with open(out, encoding='utf-8', newline='') as f:
             r = csv.reader(f)
             header = next(r, None)
-            assert header == ['time_created', 'size', 'type', 'mode', 'uid', 'gid', 'meta', 'file_name', 'source', 'flags'], header
-            for row in r:
-                if len(row) != 10 or row[8] not in ('mft', 'usn', 'bodyfile', 'ext4', 'fs', 'carved'):
+            assert header == ['time_created', 'host', 'action', 'type', 'source', 'uid', 'gid', 'volume', 'size', 'mode', 'deleted', 'meta', 'file_name', 'evidence', 'hunt', 'hunt_score', 'hunt_why', 'verdict', 'notes'], header
+            for full in r:
+                if len(full) != 19 or full[4] not in ('mft', 'usn', 'bodyfile', 'ext4', 'fs', 'carved'):
                     bad += 1
                     continue
+                # The checks below index the columns the way they were read
+                # before the layout followed masstin's: time, size, type, mode,
+                # uid, gid, meta, file_name, source, rule indicators.
+                why = full[16]
+                # Rule clauses: 'rule <id> (high|medium): ...', joined back as 'a+b'.
+                rules = '+'.join(re.findall(r'(?:^|; )rule (\w+) \((?:high|medium)\): ', why))
+                row = [full[0], full[8], full[3], full[9], full[5], full[6], full[11], full[12], full[4], rules]
                 try:
                     datetime.datetime.strptime(row[0][:19], '%Y-%m-%dT%H:%M:%S')
                     assert row[0].endswith('Z')
                     int(row[1]); int(row[4]); int(row[5])
                     assert len(row[2]) == 4 and all(c in 'macb.' for c in row[2])
+                    assert full[14] in ('', 'significant', 'candidate', 'not_evaluated', 'habitual', 'baseline')
+                    assert not rules or full[15] != '', 'a rule always scores, 0 when not measured'
+                    assert full[15] == '' or 0 <= int(full[15]) <= 100
+                    assert full[10] in ('', 'unallocated', 'dtime', 'usn')
+                    assert full[2] in ('', 'created', 'deleted', 'renamed', 'modified', 'metadata')
                 except Exception:
                     bad += 1
                 rows.append(row)

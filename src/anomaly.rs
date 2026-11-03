@@ -1,9 +1,11 @@
-//! Anti-forensics indicators, reported in the `flags` column.
+//! Anti-forensics indicators: the static rules of allymacb, reported in the
+//! analysis tail (`hunt`, `hunt_score`, `hunt_why`).
 //!
 //! None of these is proof on its own. They point at records whose timestamps
 //! or names do not look like the filesystem wrote them, so the analyst checks
-//! those first. Each indicator is a short fixed token; a row carries several
-//! joined with `+`, most rows carry none.
+//! those first. Each indicator is a short fixed token, which is also the rule
+//! id in `hunt_why`. Inside the program a record keeps them as `WARN: a+b` /
+//! `ALERT: a+b` ([`column`]); [`Rules::of`] turns that into the tail.
 
 use mft::attribute::x30::FileNameAttr;
 use mft::StandardInfoAttr;
@@ -202,6 +204,123 @@ pub fn add_to_column(column: &str, flag: &'static str) -> String {
     self::column(&flags)
 }
 
+/// What one indicator means, in the words `hunt_why` gives after its id.
+pub fn describe(flag: &str) -> &'static str {
+    match flag {
+        SI_BEFORE_FN => "$SI creation before the $FILE_NAME creation",
+        SI_SUBSEC_ZERO => "$SI times in whole seconds, the $FILE_NAME ones not",
+        B_AFTER_C => "$SI creation after the record change time",
+        FUTURE => "a timestamp more than a day after the timeline was built",
+        PRE_1980 => "a timestamp before 1980",
+        M_BEFORE_B => "modification before creation",
+        M_AFTER_C => "modification after the inode change time",
+        USN_BASIC_INFO => "USN record of a timestamp or attribute change alone",
+        BACKDATED => "an older carved copy of the record has later times",
+        RTLO_NAME => "right-to-left override in the name",
+        INVISIBLE_NAME => "invisible characters in the name",
+        DOUBLE_EXT => "a document extension followed by an executable one",
+        _ => "",
+    }
+}
+
+/// Level of one indicator among the others of its record: an indicator in
+/// [`STRONG`], or `$SI` before `$FN` together with whole-second `$SI` times,
+/// is an alert; anything else a warning.
+fn level(flag: &str, flags: &[&str]) -> Severity {
+    let pair = flags.contains(&SI_BEFORE_FN) && flags.contains(&SI_SUBSEC_ZERO);
+    if STRONG.contains(&flag) || (pair && (flag == SI_BEFORE_FN || flag == SI_SUBSEC_ZERO)) {
+        Severity::Alert
+    } else {
+        Severity::Warn
+    }
+}
+
+/// Records of the reference volume the rule rarities were measured on: the
+/// `$MFT` of the NIST Hacking Case (Windows XP, mostly stock files and two
+/// installers), one record per file.
+const MEASURED_ON: f64 = 12_183.0;
+
+/// `hunt_score` points of an indicator on an NTFS record, masstin's scale
+/// measured, not chosen: `10 · log10(records / records that fire)` on the
+/// reference volume. `None` where it is not measured yet (the Unix rules, the
+/// USN and carving ones, and every rule on a Unix record).
+///
+/// | rule | fired on | points |
+/// |---|---|---|
+/// | `si_before_fn` | 324 | 16 |
+/// | `si_subsec_zero` | 236 | 17 |
+/// | `si_before_fn` with `si_subsec_zero` | 232 | 17 for the pair |
+/// | `b_after_c` | 220 | 17 |
+/// | `future`, `pre_1980`, names | none | 41, one in 12,183 or rarer |
+fn points(flag: &str, ntfs: bool) -> Option<u32> {
+    if !ntfs {
+        return None;
+    }
+    let fired = match flag {
+        SI_BEFORE_FN => 324.0,
+        SI_SUBSEC_ZERO => 236.0,
+        B_AFTER_C => 220.0,
+        FUTURE | PRE_1980 | RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT => 1.0,
+        _ => return None,
+    };
+    Some((10.0 * (MEASURED_ON / fired).log10()).round() as u32)
+}
+
+/// Points of `$SI` before `$FN` with whole-second `$SI` times: measured as a
+/// pair (232 records), not the sum of the two.
+const PAIR_POINTS: u32 = 17;
+
+/// What the rules of one record put in the tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rules {
+    /// The strongest level among the indicators.
+    pub severity: Severity,
+    /// `hunt_score` points, 0 where none is measured.
+    pub points: u32,
+    /// One clause per indicator, strongest first, separated by `; `:
+    /// `rule si_before_fn (high): $SI creation before the $FILE_NAME creation`.
+    pub why: String,
+}
+
+/// Rule ids with their level, strongest first, `+`-joined: the `rules`
+/// column of the hunt's findings table (`future (high)+b_after_c (medium)`).
+pub fn ids(flags: &[&str]) -> String {
+    let mut sorted: Vec<(Severity, &str)> = flags.iter().map(|f| (level(f, flags), *f)).collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.0));
+    let words: Vec<String> = sorted.iter().map(|(l, f)| format!("{} ({})", f, if *l == Severity::Alert { "high" } else { "medium" })).collect();
+    words.join("+")
+}
+
+impl Rules {
+    /// The rules of a record from its internal `WARN: a+b` / `ALERT: a+b`
+    /// value; `ntfs` when the record is an NTFS one (the rarities are measured
+    /// on NTFS only). `None` when there is no indicator.
+    pub fn of(column: &str, ntfs: bool) -> Option<Rules> {
+        let flags = parse_column(column);
+        let severity = severity(&flags)?;
+        let mut sorted: Vec<(Severity, &str)> = flags.iter().map(|f| (level(f, &flags), *f)).collect();
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.0));
+        let pair = ntfs && flags.contains(&SI_BEFORE_FN) && flags.contains(&SI_SUBSEC_ZERO);
+        let mut total = if pair { PAIR_POINTS } else { 0 };
+        let mut why = Vec::with_capacity(sorted.len());
+        for (lvl, f) in sorted {
+            let word = if lvl == Severity::Alert { "high" } else { "medium" };
+            let text = describe(f);
+            let text = if text.is_empty() { f } else { text };
+            match points(f, ntfs) {
+                Some(p) => {
+                    if !(pair && (f == SI_BEFORE_FN || f == SI_SUBSEC_ZERO)) {
+                        total += p;
+                    }
+                    why.push(format!("rule {f} ({word}): {text}"));
+                }
+                None => why.push(format!("rule {f} ({word}): {text}, rarity not measured")),
+            }
+        }
+        Some(Rules { severity, points: total, why: why.join("; ") })
+    }
+}
+
 /// Current Unix time in seconds.
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -244,6 +363,31 @@ mod tests {
         assert_eq!(parse_column(""), Vec::<&str>::new());
         assert_eq!(add_to_column("WARN: si_before_fn", BACKDATED), "ALERT: si_before_fn+backdated");
         assert_eq!(add_to_column("", BACKDATED), "ALERT: backdated");
+    }
+
+    #[test]
+    fn rules_in_the_tail() {
+        assert_eq!(Rules::of("", true), None);
+        let r = Rules::of("WARN: si_before_fn", true).unwrap();
+        assert_eq!(r, Rules { severity: Severity::Warn, points: 16, why: "rule si_before_fn (medium): $SI creation before the $FILE_NAME creation".into() });
+        let r = Rules::of("ALERT: si_before_fn+si_subsec_zero", true).unwrap();
+        assert_eq!(r.severity, Severity::Alert);
+        assert_eq!(r.points, 17, "the pair is measured as one pattern");
+        assert!(r.why.starts_with("rule si_before_fn (high): ") && r.why.contains("; rule si_subsec_zero (high): "), "{}", r.why);
+        // Strongest first; points add.
+        let r = Rules::of("ALERT: b_after_c+future", true).unwrap();
+        assert_eq!(r.points, 17 + 41);
+        assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule b_after_c (medium): $SI creation after the record change time"), "{}", r.why);
+        // Not measured: no points, and the clause says so.
+        let r = Rules::of("WARN: m_before_b", false).unwrap();
+        assert_eq!(r.points, 0);
+        assert_eq!(r.why, "rule m_before_b (medium): modification before creation, rarity not measured");
+        assert_eq!(Rules::of("ALERT: future", false).unwrap().points, 0, "measured on NTFS only");
+        assert_eq!(ids(&[B_AFTER_C, FUTURE]), "future (high)+b_after_c (medium)");
+        assert_eq!(ids(&[]), "");
+        for f in [SI_BEFORE_FN, SI_SUBSEC_ZERO, B_AFTER_C, FUTURE, PRE_1980, M_BEFORE_B, M_AFTER_C, USN_BASIC_INFO, BACKDATED, RTLO_NAME, INVISIBLE_NAME, DOUBLE_EXT] {
+            assert!(!describe(f).is_empty(), "{f}");
+        }
     }
 
     #[test]

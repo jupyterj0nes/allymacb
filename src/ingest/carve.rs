@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use blockcarve::ntfs::{file_record_size, parse_indx_block, split_ref, IndxEntry};
 use blockcarve::ntfs::{file_record_number as header_record_number, FILE_MAGIC, FN_FLAG_DIRECTORY, INDX_MAGIC};
@@ -71,6 +72,11 @@ pub struct VolumeContext {
     /// `free_known` is false the whole volume is searched.
     pub free_ranges: Vec<(u64, u64)>,
     pub free_known: bool,
+    /// Hunt volume of the live records, so carved states of this volume are
+    /// compared with them (see [`crate::hunt`]); `None` = a volume of its own.
+    pub hunt_volume: Option<u32>,
+    /// Name of the partition in the `volume` column (`p2`).
+    pub label: Option<Arc<str>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -105,14 +111,14 @@ pub struct CarveStats {
 
 /// Row identity used to keep every fact once: the `(carved @…)` tag is not
 /// part of it, so a carved row that says exactly what a live row says is noise.
-type RowKey = (i64, u32, String, u64, String, String);
+type RowKey = (i64, u32, String, u64, String, String, &'static str);
 
 fn row_key(e: &TimelineEntry) -> RowKey {
     let name = match e.file_name.rfind(" (carved @0x") {
         Some(i) => &e.file_name[..i],
         None => e.file_name.as_str(),
     };
-    (e.timestamp_secs, e.timestamp_nanos, e.macb.clone(), e.size, e.meta.clone(), name.to_string())
+    (e.timestamp_secs, e.timestamp_nanos, e.macb.clone(), e.size, e.meta.clone(), name.to_string(), e.deleted)
 }
 
 type Ts = (i64, i32);
@@ -191,6 +197,8 @@ struct LiveVolume {
     end: u64,
     parser: Option<MftParser<SkipReader<BufReader<File>>>>,
     resolver: PathResolver,
+    hunt_volume: u32,
+    label: Option<Arc<str>>,
 }
 
 impl LiveVolume {
@@ -206,7 +214,8 @@ impl LiveVolume {
             }
             None => (None, PathResolver::new(0)),
         };
-        Ok(Self { start: ctx.start, end: ctx.end, parser, resolver })
+        let hunt_volume = ctx.hunt_volume.unwrap_or_else(crate::hunt::new_volume);
+        Ok(Self { start: ctx.start, end: ctx.end, parser, resolver, hunt_volume, label: ctx.label.clone() })
     }
 }
 
@@ -255,6 +264,7 @@ struct PendingRecord {
     offset: u64,
     volume: usize,
     record: u64,
+    seq: u16,
     is_dir: bool,
     allocated: bool,
     std_info: Option<StandardInfoAttr>,
@@ -363,7 +373,7 @@ impl<'a> Carver<'a> {
         for ctx in contexts {
             volumes.push(LiveVolume::open(ctx, &mut dedupe)?);
         }
-        volumes.push(LiveVolume { start: u64::MAX, end: u64::MAX, parser: None, resolver: PathResolver::new(0) });
+        volumes.push(LiveVolume { start: u64::MAX, end: u64::MAX, parser: None, resolver: PathResolver::new(0), hunt_volume: crate::hunt::new_volume(), label: None });
         let outside = volumes.len() - 1;
         Ok(Self {
             options,
@@ -426,7 +436,9 @@ impl<'a> Carver<'a> {
                 if !self.text_seen.insert((h.secs, h.nanos, h.kind, h.text.clone())) {
                     continue;
                 }
-                if let Some(row) = carve_text::row_for(&h, s + h.offset as u64) {
+                if let Some(mut row) = carve_text::row_for(&h, s + h.offset as u64) {
+                    let abs = s + h.offset as u64;
+                    row.volume = self.volumes.iter().find(|v| v.start <= abs && abs < v.end).and_then(|v| v.label.clone());
                     if h.kind == "utmp" {
                         self.stats.utmp_records += 1;
                     } else {
@@ -499,6 +511,7 @@ impl<'a> Carver<'a> {
             offset,
             volume,
             record,
+            seq: entry.header.sequence,
             is_dir: entry.is_dir(),
             allocated: entry.is_allocated(),
             std_info: attrs.std_info,
@@ -601,6 +614,8 @@ impl<'a> Carver<'a> {
             let suffix = format!(" (carved @0x{:X})", r.offset);
             let spec = RowSpec {
                 entry_id: r.record,
+                sequence: r.seq,
+                volume: self.volumes[r.volume].hunt_volume,
                 is_dir: r.is_dir,
                 is_allocated: r.allocated,
                 resolved_path: &path,
@@ -609,7 +624,11 @@ impl<'a> Carver<'a> {
                 include_file_name: include_fn,
                 extra_flags: &r.extra,
             };
+            let from = rows.len();
             record_rows(&spec, r.std_info.as_ref(), &r.fn_attrs, r.data_size, &r.ads, &mut rows);
+            for row in &mut rows[from..] {
+                row.volume = self.volumes[r.volume].label.clone();
+            }
         }
 
         let indx = std::mem::take(&mut self.indx);
@@ -623,6 +642,7 @@ impl<'a> Carver<'a> {
             collector.add(&i.fname.accessed, 'a');
             collector.add(&i.fname.mft_modified, 'c');
             collector.add(&i.fname.created, 'b');
+            let from = rows.len();
             for ((secs, nanos), macb) in collector.entries {
                 if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
                     rows.push(
@@ -642,6 +662,9 @@ impl<'a> Carver<'a> {
                         .with_flags(flags.clone()),
                     );
                 }
+            }
+            for row in &mut rows[from..] {
+                row.volume = self.volumes[i.volume].label.clone();
             }
         }
 

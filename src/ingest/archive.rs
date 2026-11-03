@@ -204,7 +204,10 @@ impl FastResult {
     fn new() -> Self {
         Self { timeline: Vec::new(), stats: ResidentStats::default(), artifacts: 0 }
     }
-    fn merge(&mut self, entries: Vec<TimelineEntry>, stats: ResidentStats) {
+    /// Adds the rows of one member; `member` names it in the `evidence`
+    /// column, `volume` is the drive letter of an `$MFT` or `$J`.
+    fn merge(&mut self, mut entries: Vec<TimelineEntry>, stats: ResidentStats, member: &str, volume: Option<&str>) {
+        super::stamp(&mut entries, Some(member), volume, None);
         self.timeline.extend(entries);
         self.stats.total_extracted += stats.total_extracted;
         self.stats.total_bytes += stats.total_bytes;
@@ -248,7 +251,8 @@ fn parse_staged<R: Read>(
     let _ = fs::remove_file(&out);
     let (entries, stats) = result?;
     log(mft_options.quiet, format!("    [+] {}: {} timeline entries from {}", kind.to_uppercase(), entries.len(), entry_label));
-    acc.merge(entries, stats);
+    let drive = format!("{}:", mft_options.drive_letter.unwrap_or('C'));
+    acc.merge(entries, stats, entry_label, Some(&drive));
     Ok(())
 }
 
@@ -268,7 +272,7 @@ fn route_member<R: Read>(
     if is_bodyfile_name(base) {
         let entries = parse_bodyfile_stream(BufReader::new(reader), Some(container_name));
         log(mft_options.quiet, format!("    [+] Bodyfile: {} timeline entries from {}", entries.len(), name));
-        acc.merge(entries, ResidentStats::default());
+        acc.merge(entries, ResidentStats::default(), name, None);
         return Ok(true);
     }
     if is_mft_name(base) {
@@ -420,7 +424,7 @@ pub fn process_archive_fast(
         if is_bodyfile_name(&inner) || looks_like_bodyfile(&first_line) {
             let entries = parse_bodyfile_stream(gz, Some(container_name));
             log(mft_options.quiet, format!("    [+] Bodyfile: {} timeline entries from {}", entries.len(), fname));
-            acc.merge(entries, ResidentStats::default());
+            acc.merge(entries, ResidentStats::default(), fname.strip_suffix(".gz").unwrap_or(fname), None);
         } else if is_mft_name(&inner) {
             parse_staged("mft", &mut gz, fname, mft_options, staging_dir, &mut acc)?;
         } else if is_usn_name(&inner) {
@@ -431,6 +435,9 @@ pub fn process_archive_fast(
     if acc.artifacts == 0 {
         Ok(None)
     } else {
+        // Every row of the collection carries its name as the host, as its
+        // bodyfile rows already do.
+        super::stamp(&mut acc.timeline, None, None, Some(container_name));
         Ok(Some((acc.timeline, acc.stats)))
     }
 }

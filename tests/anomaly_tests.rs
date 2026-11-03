@@ -122,6 +122,6 @@ fn cli_reports_indicator_counts_on_stderr() {
     assert!(stderr.contains("[ALERT]   m_after_c") && stderr.contains("/home/u/touched"), "{}", stderr);
     assert!(stderr.contains("[ALERT]   double_ext") && stderr.contains("ok.pdf.exe"), "{}", stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.lines().any(|l| l.ends_with(",bodyfile,ALERT: m_after_c")), "{}", stdout);
+    assert!(stdout.lines().any(|l| l.contains("/home/u/touched,") && l.ends_with(",significant,0,\"rule m_after_c (high): modification after the inode change time, rarity not measured\",,")), "{}", stdout);
     let _ = fs::remove_dir_all(&dir);
 }

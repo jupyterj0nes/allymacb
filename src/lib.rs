@@ -1,7 +1,9 @@
 pub mod anomaly;
 pub mod cli;
 pub mod error;
+pub mod hunt;
 pub mod ingest;
 pub mod parsers;
+pub mod stats;
 pub mod timefmt;
 pub mod timeline;

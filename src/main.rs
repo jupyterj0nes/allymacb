@@ -3,6 +3,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use allymacb::anomaly;
+use allymacb::hunt;
 use allymacb::cli::Cli;
 use allymacb::ingest::process_evidence_inputs;
 use allymacb::parsers::mft::MftParseOptions;
@@ -45,7 +46,10 @@ fn report_anomalies(timeline: &[TimelineEntry]) {
             continue;
         }
         let flags = anomaly::parse_column(&e.flags);
-        let name = base_name(&e.file_name);
+        let name = match e.host.as_deref() {
+            Some(h) => format!("[{}] {}", h, base_name(&e.file_name)),
+            None => base_name(&e.file_name),
+        };
         let key = (e.meta.clone(), name);
         match anomaly::severity(&flags) {
             Some(anomaly::Severity::Alert) => {
@@ -62,30 +66,89 @@ fn report_anomalies(timeline: &[TimelineEntry]) {
 
     if !alerts.is_empty() {
         eprintln!();
-        eprintln!("[ALERT] {} file(s) with anti-forensics indicators (timestomping, name tricks). flags column says ALERT:", alerts.len());
+        eprintln!("[ALERT] {} file(s) with high-level rule indicators (timestomping, name tricks): `significant` in the hunt column, `rule <id> (high)` in hunt_why:", alerts.len());
         for ((meta, name), flags) in alerts.iter().take(MAX_ALERT_LINES) {
             let joined: Vec<&str> = flags.iter().copied().collect();
             eprintln!("[ALERT]   {:<34} {}  (meta {})", joined.join("+"), name, meta);
         }
         if alerts.len() > MAX_ALERT_LINES {
-            eprintln!("[ALERT]   ... and {} more; filter the flags column for ALERT", alerts.len() - MAX_ALERT_LINES);
+            eprintln!("[ALERT]   ... and {} more; filter hunt_why for \"(high)\"", alerts.len() - MAX_ALERT_LINES);
         }
     }
     if !warn_files.is_empty() {
         let detail: Vec<String> = warn_files.iter().map(|(f, s)| format!("{} {}", f, s.len())).collect();
         let total: BTreeSet<&(String, String)> = warn_files.values().flatten().collect();
         eprintln!(
-            "[!] {} file(s) with WARN-level indicators ({}): also produced by preserved-timestamp copies and installers; filter the flags column for WARN",
+            "[!] {} file(s) with medium-level rule indicators ({}): also produced by preserved-timestamp copies and installers; `candidate` in the hunt column, `rule <id> (medium)` in hunt_why",
             total.len(),
             detail.join(", ")
         );
     }
 }
 
+/// How many significant hunt records are listed one by one on stderr.
+const MAX_HUNT_LINES: usize = 40;
+
+/// Runs the statistical hunt, writes its verdict into the analysis tail of
+/// every row and reports. Returns false when the hunt CSV could not be written.
+fn run_hunt(timeline: &mut [TimelineEntry], from: i64, args: &Cli) -> bool {
+    let rep = hunt::run(timeline, &hunt::HuntOptions { from, alpha: args.alpha });
+    let mut outside = 0usize;
+    for e in timeline.iter_mut() {
+        e.mark = e.hunt.as_deref().and_then(|h| rep.mark(h));
+        outside += usize::from(e.mark.is_none());
+    }
+
+    if !args.quiet {
+        eprintln!();
+        eprintln!("[*] Hunt: records active from {} UTC tested against the earlier records of their volume, FDR {}", fmt_cutoff(from), args.alpha);
+        for n in &rep.notes {
+            eprintln!("    {}", n);
+        }
+        let c = rep.counts();
+        eprintln!(
+            "    records: {} significant, {} candidate, {} not evaluated, {} habitual, {} baseline; {} row(s) outside the hunt",
+            c[0], c[1], c[2], c[3], c[4], outside
+        );
+    }
+    let significant: Vec<&hunt::Finding> = rep.findings.iter().filter(|f| f.significant).collect();
+    let tested = rep.findings.iter().filter(|f| f.state != hunt::State::NotEvaluated).count();
+    if significant.is_empty() {
+        eprintln!("[*] Hunt: no record significant at FDR {} among {} tested", args.alpha, tested);
+    } else {
+        eprintln!(
+            "[ALERT] Hunt: {} of {} tested record(s) significant at FDR {}; `significant` in the hunt column",
+            significant.len(),
+            tested,
+            args.alpha
+        );
+        for f in significant.iter().take(MAX_HUNT_LINES) {
+            eprintln!("[ALERT]   {}", hunt::describe(f));
+        }
+        if significant.len() > MAX_HUNT_LINES {
+            eprintln!("[ALERT]   ... and {} more; see --hunt-out", significant.len() - MAX_HUNT_LINES);
+        }
+    }
+    if let Some(path) = &args.hunt_out {
+        if let Err(e) = hunt::write_csv(&rep, path) {
+            eprintln!("[!] {}", e);
+            return false;
+        }
+        if !args.quiet {
+            eprintln!("[*] Hunt CSV: {} ({} rows)", path.display(), rep.findings.len());
+        }
+    }
+    true
+}
+
+fn fmt_cutoff(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default()
+}
+
 /// File name without the per-row tags, so the rows of one file collapse.
 fn base_name(file_name: &str) -> String {
     let mut s = file_name;
-    for tag in [" ($FILE_NAME: ", " (carved @0x", " ($I30)", " (deleted)", " (USN: "] {
+    for tag in [" ($FILE_NAME: ", " (carved @0x", " ($I30)", " (USN: "] {
         if let Some(i) = s.find(tag) {
             s = &s[..i];
         }
@@ -100,6 +163,23 @@ fn main() -> ExitCode {
 
     if !args.quiet {
         print_banner();
+    }
+
+    let cutoff = match args.investigation_from.as_deref().map(|s| (s, hunt::parse_cutoff(s))) {
+        Some((s, None)) => {
+            eprintln!("[!] --investigation-from: cannot read '{}' as a UTC time (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or RFC 3339)", s);
+            return ExitCode::from(EXIT_USAGE);
+        }
+        Some((_, Some(t))) => Some(t),
+        None => None,
+    };
+    if !(args.alpha > 0.0 && args.alpha < 1.0) {
+        eprintln!("[!] --alpha must be between 0 and 1 (exclusive)");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if cutoff.is_none() && args.hunt_out.is_some() {
+        eprintln!("[!] --hunt-out needs --investigation-from");
+        return ExitCode::from(EXIT_USAGE);
     }
 
     if args.files.is_empty() && args.directories.is_empty() && args.usn.is_none() {
@@ -151,6 +231,11 @@ fn main() -> ExitCode {
 
     let carved = report.timeline.iter().filter(|e| e.source == source::CARVED).count();
 
+    let mut hunt_failed = false;
+    if let Some(from) = cutoff {
+        hunt_failed = !run_hunt(&mut report.timeline, from, &args);
+    }
+
     report_anomalies(&report.timeline);
 
     let count = match TimelineWriter::write_entries(&mut report.timeline, args.output.as_deref()) {
@@ -187,6 +272,10 @@ fn main() -> ExitCode {
         }
         eprintln!("  Elapsed time             : {:.2?}", start_time.elapsed());
         eprintln!("=================================================");
+    }
+
+    if hunt_failed {
+        return ExitCode::from(EXIT_PARTIAL);
     }
 
     if report.sources_failed > 0 {

@@ -50,4 +50,19 @@ pub struct Cli {
     /// Off by default. Recovered rows say `carved` in the source column and carry the image offset.
     #[arg(long = "carve")]
     pub carve: bool,
+
+    /// Statistical hunt for manipulated timestamps. Records active at or after this
+    /// time (UTC: "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS" or RFC 3339) are tested against
+    /// the earlier records of the same volume; every row gets the verdict on its record
+    /// in the hunt, hunt_score and hunt_why columns. Off unless given.
+    #[arg(long = "investigation-from", value_name = "TIME")]
+    pub investigation_from: Option<String>,
+
+    /// False discovery rate of the hunt (Benjamini-Hochberg)
+    #[arg(long = "alpha", default_value_t = 0.05, value_name = "RATE")]
+    pub alpha: f64,
+
+    /// Write the hunt's findings table (19 columns, laid out like masstin's) to this CSV
+    #[arg(long = "hunt-out", value_name = "CSV")]
+    pub hunt_out: Option<PathBuf>,
 }

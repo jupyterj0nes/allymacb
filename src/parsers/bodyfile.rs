@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::BufRead;
+use std::sync::Arc;
 
 use crate::error::{AllyError, ErrorCode};
 use crate::timefmt::format_unix_timestamp;
 use crate::anomaly;
+use crate::hunt::{self, HuntRecord};
 use crate::timeline::{join_macb_flags, source, TimelineEntry};
 
 /// Number of pipe-separated fields in a TSK 3.x bodyfile line:
@@ -111,11 +113,8 @@ pub fn parse_bodyfile_line(
     let ctime = parse_ts(tail[7], "ctime", line_num)?;
     let crtime = parse_ts(tail[8], "crtime", line_num)?;
 
-    let full_path = if let Some(p) = prefix {
-        format!("[{}] {}", p, raw_path)
-    } else {
-        raw_path.to_string()
-    };
+    let full_path = raw_path.to_string();
+    let host: Option<Arc<str>> = prefix.map(Arc::from);
 
     // Group timestamps: secs -> macb string
     let mut ts_map: HashMap<i64, String> = HashMap::new();
@@ -153,8 +152,32 @@ pub fn parse_bodyfile_line(
             );
         }
     }
+    for e in &mut entries {
+        e.host = host.clone();
+    }
 
     Ok(entries)
+}
+
+/// Hunt record of one bodyfile line: the inode's four times in whole seconds.
+/// `fls` on NTFS writes the inode as `entry-type-id`: those lines are NTFS
+/// records with their `$SI` times (the hunt then leaves out what NTFS does
+/// not guarantee), and its `$FILE_NAME` lines are not records of their own.
+fn hunt_record(line: &str, volume: u32) -> Option<Arc<HuntRecord>> {
+    let fields: Vec<&str> = line.trim().rsplitn(10, '|').collect();
+    if fields.len() < 10 || fields[9].contains("($FILE_NAME)") {
+        return None;
+    }
+    let t = |s: &str| s.trim().parse::<f64>().ok().filter(|v| *v != 0.0).map(|v| (v.floor() as i64, ((v - v.floor()) * 1e9) as u32));
+    let inode = fields[8].split('-').next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let macb = hunt::Macb { a: t(fields[3]), m: t(fields[2]), c: t(fields[1]), b: t(fields[0]) };
+    let evidence = if fields[8].contains('-') {
+        // Sequence 0: unknown, so the allocation-order check stays out.
+        hunt::Evidence::Ntfs { entry: inode, seq: 0, si: macb, fns: Vec::new() }
+    } else {
+        hunt::Evidence::Unix { inode, t: macb }
+    };
+    Some(hunt::record(volume, evidence))
 }
 
 /// Parses a bodyfile stream and returns the entries together with a report
@@ -169,6 +192,8 @@ pub fn parse_bodyfile_stream_with_report<R: BufRead>(
     let mut report = BodyfileReport::default();
     let mut raw = Vec::new();
     let mut line_num = 0usize;
+    let volume = hunt::new_volume();
+    let host: Option<Arc<str>> = prefix.map(Arc::from);
 
     loop {
         raw.clear();
@@ -191,10 +216,15 @@ pub fn parse_bodyfile_stream_with_report<R: BufRead>(
         }
         report.lines_total += 1;
 
-        match parse_bodyfile_line(&line, line_num, prefix) {
+        // The host is set here, shared by every row, rather than per line.
+        match parse_bodyfile_line(&line, line_num, None) {
             Ok(entries) => {
                 report.lines_parsed += 1;
-                timeline.extend(entries);
+                let record = hunt_record(&line, volume);
+                timeline.extend(entries.into_iter().map(|mut e| {
+                    e.host = host.clone();
+                    e.with_hunt(record.clone())
+                }));
             }
             Err(e) => {
                 report.lines_rejected += 1;
@@ -242,13 +272,14 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         let ma_entry = entries.iter().find(|e| e.macb == "ma..").unwrap();
-        assert_eq!(ma_entry.file_name, "[server01] /etc/passwd-");
+        assert_eq!(ma_entry.file_name, "/etc/passwd-");
+        assert_eq!(ma_entry.host.as_deref(), Some("server01"));
         assert_eq!(ma_entry.size, 2323);
         assert_eq!(ma_entry.meta, "4230");
         assert_eq!(ma_entry.mode, "-rw-r--r--");
 
         let c_entry = entries.iter().find(|e| e.macb == "..c.").unwrap();
-        assert_eq!(c_entry.file_name, "[server01] /etc/passwd-");
+        assert_eq!(c_entry.file_name, "/etc/passwd-");
     }
 
     #[test]

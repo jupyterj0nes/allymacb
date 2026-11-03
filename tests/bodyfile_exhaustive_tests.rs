@@ -45,7 +45,8 @@ fn test_bodyfile_hostname_prefixing() {
     let line = "0|/var/log/syslog|500|-rw-r--r--|0|0|1024|1700000000|1700000000|1700000000|0";
     let entries = parse_bodyfile_line(line, 1, Some("srv-web01")).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].file_name, "[srv-web01] /var/log/syslog");
+    assert_eq!(entries[0].file_name, "/var/log/syslog");
+    assert_eq!(entries[0].host.as_deref(), Some("srv-web01"));
 
     let no_prefix = parse_bodyfile_line(line, 1, None).unwrap();
     assert_eq!(no_prefix[0].file_name, "/var/log/syslog");
@@ -117,8 +118,9 @@ fn test_bodyfile_multi_line_stream() {
     assert_eq!(entries.len(), 50);
 
     for (i, entry) in entries.iter().enumerate() {
-        let expected_name = format!("[server] /usr/lib/lib{}.so", i + 1);
+        let expected_name = format!("/usr/lib/lib{}.so", i + 1);
         assert_eq!(entry.file_name, expected_name);
+        assert_eq!(entry.host.as_deref(), Some("server"));
         assert_eq!(entry.macb, "mac.");
         assert_eq!(entry.size, ((i + 1) * 1024) as u64);
         assert_eq!(entry.mode, "-rwxr-xr-x");

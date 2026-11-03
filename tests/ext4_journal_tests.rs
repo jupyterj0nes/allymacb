@@ -41,6 +41,11 @@ fn find<'a>(rows: &'a [TimelineEntry], name: &str, src: &str) -> Vec<&'a Timelin
     rows.iter().filter(|r| r.file_name.starts_with(name) && r.source == src).collect()
 }
 
+/// Rows of exactly `name` whose `deleted` column says how it was deleted.
+fn deleted<'a>(rows: &'a [TimelineEntry], name: &str) -> Vec<&'a TimelineEntry> {
+    rows.iter().filter(|r| r.file_name == name && r.source == source::EXT4 && !r.deleted.is_empty()).collect()
+}
+
 #[test]
 fn live_tree_has_inode_numbers_ctime_and_deleted_inodes() {
     let rows = rows(false);
@@ -53,7 +58,7 @@ fn live_tree_has_inode_numbers_ctime_and_deleted_inodes() {
     assert_eq!(alive[0].mode, "-rw-r--r--");
     // keep/old.txt is 650 bytes now; the deleted gone.txt has no name without the journal
     assert_eq!(find(&rows, "/keep/old.txt", source::EXT4)[0].size, 650);
-    assert!(!find(&rows, "/[UNKNOWN]/inode_18 (deleted)", source::EXT4).is_empty());
+    assert!(!deleted(&rows, "/[UNKNOWN]/inode_18").is_empty());
     assert!(find(&rows, "/docs/gone.txt", source::EXT4).is_empty());
     let stomp = find(&rows, "/docs/stomp.txt", source::EXT4);
     assert!(stomp.iter().any(|r| r.timestamp.starts_with("1975-06-15") && r.macb.starts_with("ma")));
@@ -64,7 +69,7 @@ fn live_tree_has_inode_numbers_ctime_and_deleted_inodes() {
 fn journal_names_deleted_files_and_recovers_older_states() {
     let rows = rows(true);
     // The deleted inode is named through a journal copy of its directory.
-    assert!(!find(&rows, "/docs/gone.txt (deleted)", source::EXT4).is_empty());
+    assert!(!deleted(&rows, "/docs/gone.txt").is_empty());
     assert!(find(&rows, "/[UNKNOWN]/inode_18", source::EXT4).is_empty());
     // Its pre-deletion state (400 bytes) is a carved row.
     let gone = find(&rows, "/docs/gone.txt (carved @0x", source::CARVED);
@@ -73,8 +78,8 @@ fn journal_names_deleted_files_and_recovers_older_states() {
     assert!(find(&rows, "/keep/old.txt (carved @0x", source::CARVED).iter().any(|r| r.size == 400));
     assert!(!find(&rows, "/keep/renamed_before.txt (carved @0x", source::CARVED).is_empty());
     // The whole deleted tree gets its path back, parents included.
-    assert!(!find(&rows, "/deep/a/b/deep.txt (deleted)", source::EXT4).is_empty());
-    assert!(!find(&rows, "/deep/a (deleted)", source::EXT4).is_empty());
+    assert!(!deleted(&rows, "/deep/a/b/deep.txt").is_empty());
+    assert!(!deleted(&rows, "/deep/a").is_empty());
     // stomp.txt: the journal still has the state before `touch -d 1975`, so the live
     // rows and the carved one say backdated.
     let live = find(&rows, "/docs/stomp.txt", source::EXT4);
@@ -96,7 +101,7 @@ fn cli_reads_a_bare_ext4_image_and_carves_its_journal() {
     let out = Command::new(env!("CARGO_BIN_EXE_allymacb")).arg("--carve").arg("-f").arg(&img).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.lines().any(|l| l.contains("/docs/gone.txt (deleted),ext4,")), "{}", stdout);
+    assert!(stdout.lines().any(|l| l.contains(",ext4,") && (l.contains(",dtime,") || l.contains(",unallocated,")) && l.contains(",/docs/gone.txt,")), "{}", stdout);
     assert!(stdout.lines().any(|l| l.contains("/keep/renamed_before.txt (carved @0x") && l.contains(",carved,")), "{}", stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("[ALERT]") && stderr.contains("backdated"), "{}", stderr);

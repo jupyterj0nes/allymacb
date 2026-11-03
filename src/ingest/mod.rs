@@ -4,10 +4,12 @@ pub mod carve_text;
 pub mod image;
 pub mod triage;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 use crate::error::{AllyError, ErrorCode, Result};
@@ -136,6 +138,44 @@ impl IngestReport {
     }
 }
 
+/// Says where rows came from, one layer at a time, from the inside out: a
+/// partition stamps `p2:$MFT`, the image around it `disk.E01`, giving
+/// `disk.E01:p2:$MFT`. `evidence` goes in front of what the rows already
+/// carry; `volume` and `host` only fill rows that have none. The values are
+/// shared between rows.
+pub(crate) fn stamp(entries: &mut [TimelineEntry], evidence: Option<&str>, volume: Option<&str>, host: Option<&str>) {
+    let outer: Option<Arc<str>> = evidence.filter(|s| !s.is_empty()).map(Arc::from);
+    let volume: Option<Arc<str>> = volume.map(Arc::from);
+    let host: Option<Arc<str>> = host.filter(|s| !s.is_empty()).map(Arc::from);
+    let mut joined: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+    for e in entries {
+        if let Some(o) = &outer {
+            e.evidence = Some(match e.evidence.take() {
+                None => o.clone(),
+                Some(inner) => joined.entry(inner.clone()).or_insert_with(|| Arc::from(format!("{}:{}", o, inner))).clone(),
+            });
+        }
+        if e.volume.is_none() {
+            e.volume = volume.clone();
+        }
+        if e.host.is_none() {
+            e.host = host.clone();
+        }
+    }
+}
+
+/// Name of an input as the `evidence` column shows it: the file or
+/// directory name, without the analyst's path to it.
+fn input_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// `C:`: the volume of a loose `$MFT` or `$J`, named after the drive letter
+/// its paths are written with.
+fn drive(mft_options: &MftParseOptions) -> String {
+    format!("{}:", mft_options.drive_letter.unwrap_or('C'))
+}
+
 fn info(quiet: bool, msg: String) {
     if !quiet {
         eprintln!("{}", msg);
@@ -152,9 +192,11 @@ fn usn_options(mft_options: &MftParseOptions) -> UsnParseOptions {
 
 fn parse_bodyfile_path(path: &Path) -> Result<Vec<TimelineEntry>> {
     let f = fs::File::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening bodyfile {}", path.display())))?;
+    // The stem names the host (`server01.body`); `bodyfile.txt` names nothing.
     let prefix = path
         .file_stem()
         .and_then(|s| s.to_str())
+        .filter(|s| !s.eq_ignore_ascii_case("bodyfile") && !s.eq_ignore_ascii_case("body"))
         .map(|s| s.to_string());
     Ok(parse_bodyfile_stream(BufReader::new(f), prefix.as_deref()))
 }
@@ -200,13 +242,12 @@ fn timeline_extracted_archive(
     // The extracted tree may itself contain MFTs/images/archives (nested evidence).
     let (mut entries, stats) = process_directory_internal(&extract_target, mft_options, workspace.temp_dir(), report, true);
     let target_prefix = extract_target.to_string_lossy().to_string();
-    let archive_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("archive");
     for entry in &mut entries {
         if entry.file_name.starts_with(&target_prefix) {
-            let rel = entry.file_name[target_prefix.len()..].trim_start_matches(['\\', '/']);
-            entry.file_name = format!("[{}]\\{}", archive_name, rel);
+            entry.file_name = entry.file_name[target_prefix.len()..].trim_start_matches(['\\', '/']).to_string();
         }
     }
+    // The archive itself is named in `evidence` by the caller, like any input.
     report.ok(entries, stats);
 }
 
@@ -226,101 +267,12 @@ pub fn process_evidence_inputs(
             report.fail(format!("File not found: {}", file_path.display()));
             continue;
         }
-
-        let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let fname_lower = fname.to_lowercase();
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        if is_image_extension(&ext) {
-            info(quiet, format!("[*] Processing forensic image: {}", file_path.display()));
-            match parse_forensic_image(file_path, mft_options, workspace.temp_dir()) {
-                Ok((entries, stats)) => report.ok(entries, stats),
-                Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-            }
-        } else if is_archive_extension(&ext) {
-            info(quiet, format!("[*] Inspecting archive: {}", file_path.display()));
-            match process_archive_fast(file_path, mft_options, workspace.temp_dir()) {
-                Ok(Some((entries, stats))) => {
-                    info(quiet, format!("    [+] {} timeline entries streamed directly from container", entries.len()));
-                    report.ok(entries, stats);
-                }
-                Ok(None) => timeline_extracted_archive(file_path, mft_options, &workspace, &mut report),
-                Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-            }
-        } else if is_mft_name(&fname_lower) {
-            info(quiet, format!("[*] Parsing MFT file: {}", file_path.display()));
-            match parse_mft_file(file_path, mft_options) {
-                Ok((entries, stats)) => report.ok(entries, stats),
-                Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-            }
-        } else if is_usn_name(&fname_lower) || fname_lower.contains("usnjrnl") {
-            info(quiet, format!("[*] Parsing USN Journal file: {}", file_path.display()));
-            match parse_usn_file(file_path, &usn_options(mft_options)) {
-                Ok(entries) => report.ok(entries, ResidentStats::default()),
-                Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-            }
-        } else if is_bodyfile_name(&fname_lower) {
-            info(quiet, format!("[*] Parsing bodyfile: {}", file_path.display()));
-            match parse_bodyfile_path(file_path) {
-                Ok(entries) => report.ok(entries, ResidentStats::default()),
-                Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-            }
-        } else {
-            // Sniff the content.
-            match sniff_file(file_path) {
-                Ok(Sniffed::Mft) => {
-                    info(quiet, format!("[*] Identified MFT signature in {}", file_path.display()));
-                    match parse_mft_file(file_path, mft_options) {
-                        Ok((entries, stats)) => report.ok(entries, stats),
-                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                    }
-                }
-                Ok(Sniffed::Bodyfile) => {
-                    info(quiet, format!("[*] Identified bodyfile content in {}", file_path.display()));
-                    match parse_bodyfile_path(file_path) {
-                        Ok(entries) => report.ok(entries, ResidentStats::default()),
-                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                    }
-                }
-                Ok(Sniffed::Image) => {
-                    info(quiet, format!("[*] Identified disk/volume image signature in {}", file_path.display()));
-                    match parse_forensic_image(file_path, mft_options, workspace.temp_dir()) {
-                        Ok((entries, stats)) => report.ok(entries, stats),
-                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                    }
-                }
-                Ok(Sniffed::Unknown) if mft_options.carve => {
-                    info(quiet, format!("[*] Unrecognized file, carving it for NTFS records: {}", file_path.display()));
-                    match carve::carve_blob(file_path, mft_options) {
-                        Ok((entries, stats)) => {
-                            info(quiet, format!("    [+] Carving: {}", carve::describe_stats(&stats)));
-                            if entries.is_empty() {
-                                report.fail(format!("{}: carving found no NTFS FILE records or $I30 entries", file_path.display()));
-                            } else {
-                                report.ok(entries, ResidentStats::default());
-                            }
-                        }
-                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                    }
-                }
-                Ok(Sniffed::Unknown) => {
-                    report.warn(format!(
-                        "{}: unrecognized evidence type; timelining the host filesystem metadata of this file only (use --carve to scan it for NTFS records)",
-                        file_path.display()
-                    ));
-                    match walk_directory_timeline(file_path) {
-                        Ok(entries) => report.ok(entries, ResidentStats::default()),
-                        Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                    }
-                }
-                Err(e) => report.fail(format!("{}: cannot read: {}", file_path.display(), e)),
-            }
-        }
+        let before = report.timeline.len();
+        process_file(file_path, mft_options, &workspace, &mut report);
+        let name = input_name(file_path);
+        stamp(&mut report.timeline[before..], Some(&name), None, None);
     }
+
 
     // 2. Process specified directories / triages
     for dir_path in directories {
@@ -332,7 +284,8 @@ pub fn process_evidence_inputs(
         info(quiet, format!("[*] Scanning evidence directory: {}", dir_path.display()));
         let before_ok = report.sources_ok;
         let before_failed = report.sources_failed;
-        let (entries, stats) = process_directory_internal(dir_path, mft_options, workspace.temp_dir(), &mut report, false);
+        let (mut entries, stats) = process_directory_internal(dir_path, mft_options, workspace.temp_dir(), &mut report, false);
+        stamp(&mut entries, Some(&input_name(dir_path)), None, None);
         if report.sources_ok == before_ok && report.sources_failed == before_failed && entries.is_empty() {
             report.fail(format!("{}: no evidence found", dir_path.display()));
         } else {
@@ -349,7 +302,10 @@ pub fn process_evidence_inputs(
         if usn_path.exists() {
             info(quiet, format!("[*] Parsing standalone USN Journal: {}", usn_path.display()));
             match parse_usn_file(usn_path, &usn_options(mft_options)) {
-                Ok(entries) => report.ok(entries, ResidentStats::default()),
+                Ok(mut entries) => {
+                    stamp(&mut entries, Some(&input_name(usn_path)), Some(&drive(mft_options)), None);
+                    report.ok(entries, ResidentStats::default())
+                }
                 Err(e) => report.fail(format!("{}: {}", usn_path.display(), e)),
             }
         } else {
@@ -358,6 +314,118 @@ pub fn process_evidence_inputs(
     }
 
     Ok(report)
+}
+
+/// Parses one input given with `-f`, by name, extension or content.
+fn process_file(file_path: &Path, mft_options: &MftParseOptions, workspace: &EvidenceWorkspace, report: &mut IngestReport) {
+    let quiet = mft_options.quiet;
+    let before = report.timeline.len();
+    let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let fname_lower = fname.to_lowercase();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if is_image_extension(&ext) {
+        info(quiet, format!("[*] Processing forensic image: {}", file_path.display()));
+        match parse_forensic_image(file_path, mft_options, workspace.temp_dir()) {
+            Ok((entries, stats)) => report.ok(entries, stats),
+            Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+        }
+    } else if is_archive_extension(&ext) {
+        info(quiet, format!("[*] Inspecting archive: {}", file_path.display()));
+        match process_archive_fast(file_path, mft_options, workspace.temp_dir()) {
+            Ok(Some((entries, stats))) => {
+                info(quiet, format!("    [+] {} timeline entries streamed directly from container", entries.len()));
+                report.ok(entries, stats);
+            }
+            Ok(None) => timeline_extracted_archive(file_path, mft_options, workspace, report),
+            Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+        }
+    } else if is_mft_name(&fname_lower) {
+        info(quiet, format!("[*] Parsing MFT file: {}", file_path.display()));
+        match parse_mft_file(file_path, mft_options) {
+            Ok((entries, stats)) => report.ok(entries, stats),
+            Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+        }
+    } else if is_usn_name(&fname_lower) || fname_lower.contains("usnjrnl") {
+        info(quiet, format!("[*] Parsing USN Journal file: {}", file_path.display()));
+        match parse_usn_file(file_path, &usn_options(mft_options)) {
+            Ok(entries) => report.ok(entries, ResidentStats::default()),
+            Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+        }
+    } else if is_bodyfile_name(&fname_lower) {
+        info(quiet, format!("[*] Parsing bodyfile: {}", file_path.display()));
+        match parse_bodyfile_path(file_path) {
+            Ok(entries) => report.ok(entries, ResidentStats::default()),
+            Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+        }
+    } else {
+        // Sniff the content.
+        match sniff_file(file_path) {
+            Ok(Sniffed::Mft) => {
+                info(quiet, format!("[*] Identified MFT signature in {}", file_path.display()));
+                match parse_mft_file(file_path, mft_options) {
+                    Ok((entries, stats)) => report.ok(entries, stats),
+                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                }
+            }
+            Ok(Sniffed::Bodyfile) => {
+                info(quiet, format!("[*] Identified bodyfile content in {}", file_path.display()));
+                match parse_bodyfile_path(file_path) {
+                    Ok(entries) => report.ok(entries, ResidentStats::default()),
+                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                }
+            }
+            Ok(Sniffed::Image) => {
+                info(quiet, format!("[*] Identified disk/volume image signature in {}", file_path.display()));
+                match parse_forensic_image(file_path, mft_options, workspace.temp_dir()) {
+                    Ok((entries, stats)) => report.ok(entries, stats),
+                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                }
+            }
+            Ok(Sniffed::Unknown) if mft_options.carve => {
+                info(quiet, format!("[*] Unrecognized file, carving it for NTFS records: {}", file_path.display()));
+                match carve::carve_blob(file_path, mft_options) {
+                    Ok((entries, stats)) => {
+                        info(quiet, format!("    [+] Carving: {}", carve::describe_stats(&stats)));
+                        if entries.is_empty() {
+                            report.fail(format!("{}: carving found no NTFS FILE records or $I30 entries", file_path.display()));
+                        } else {
+                            report.ok(entries, ResidentStats::default());
+                        }
+                    }
+                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                }
+            }
+            Ok(Sniffed::Unknown) => {
+                report.warn(format!(
+                    "{}: unrecognized evidence type; timelining the host filesystem metadata of this file only (use --carve to scan it for NTFS records)",
+                    file_path.display()
+                ));
+                match walk_directory_timeline(file_path) {
+                    Ok(entries) => report.ok(entries, ResidentStats::default()),
+                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
+                }
+            }
+            Err(e) => report.fail(format!("{}: cannot read: {}", file_path.display(), e)),
+        }
+    }
+    fill_drive(&mut report.timeline[before..], mft_options);
+}
+
+/// Volume of `$MFT` and `$J` rows read outside an image: the drive letter
+/// their paths are written with. Rows from an image already name their
+/// partition.
+fn fill_drive(entries: &mut [TimelineEntry], mft_options: &MftParseOptions) {
+    let d: Arc<str> = Arc::from(drive(mft_options));
+    for e in entries {
+        if e.volume.is_none() && (e.source == crate::timeline::source::MFT || e.source == crate::timeline::source::USN) {
+            e.volume = Some(d.clone());
+        }
+    }
 }
 
 /// Scans a directory for every supported artifact and parses each one.
@@ -404,13 +472,18 @@ fn process_directory_internal(
         }
     }
 
+    let rel = |p: &Path| p.strip_prefix(dir_path).unwrap_or(p).to_string_lossy().replace('\\', "/");
     fn merge(
         timeline: &mut Vec<TimelineEntry>,
         total: &mut ResidentStats,
-        entries: Vec<TimelineEntry>,
+        mut entries: Vec<TimelineEntry>,
         stats: ResidentStats,
         report: &mut IngestReport,
+        evidence: Option<&str>,
+        mft_options: &MftParseOptions,
     ) {
+        stamp(&mut entries, evidence, None, None);
+        fill_drive(&mut entries, mft_options);
         timeline.extend(entries);
         total.total_extracted += stats.total_extracted;
         total.total_bytes += stats.total_bytes;
@@ -422,7 +495,7 @@ fn process_directory_internal(
     for mft_p in &mft_files {
         info(quiet, format!("[*] Found MFT in triage: {}", mft_p.display()));
         match parse_mft_file(mft_p, mft_options) {
-            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report),
+            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(mft_p)), mft_options),
             Err(e) => report.fail(format!("{}: {}", mft_p.display(), e)),
         }
     }
@@ -430,7 +503,7 @@ fn process_directory_internal(
     for usn_p in &usn_files {
         info(quiet, format!("[*] Found USN journal in triage: {}", usn_p.display()));
         match parse_usn_file(usn_p, &usn_options(mft_options)) {
-            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report),
+            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, Some(&rel(usn_p)), mft_options),
             Err(e) => report.fail(format!("{}: {}", usn_p.display(), e)),
         }
     }
@@ -438,7 +511,7 @@ fn process_directory_internal(
     for body_p in &body_files {
         info(quiet, format!("[*] Found bodyfile in triage: {}", body_p.display()));
         match parse_bodyfile_path(body_p) {
-            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report),
+            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, Some(&rel(body_p)), mft_options),
             Err(e) => report.fail(format!("{}: {}", body_p.display(), e)),
         }
     }
@@ -446,7 +519,7 @@ fn process_directory_internal(
     for img_p in &image_files {
         info(quiet, format!("[*] Found disk image in directory: {}", img_p.display()));
         match parse_forensic_image(img_p, mft_options, temp_dir) {
-            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report),
+            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(img_p)), mft_options),
             Err(e) => report.fail(format!("{}: {}", img_p.display(), e)),
         }
     }
@@ -463,7 +536,7 @@ fn process_directory_internal(
 
         for (arch_p, res) in results {
             match res {
-                Ok(Some((entries, stats))) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report),
+                Ok(Some((entries, stats))) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(&arch_p)), mft_options),
                 Ok(None) => report.warn(format!(
                     "{}: no $MFT, USN journal or bodyfile inside (archives found via -d are not extracted; pass it with -f to timeline its contents)",
                     arch_p.display()
@@ -493,7 +566,7 @@ fn process_directory_internal(
                         dir_path.display()
                     ));
                 }
-                merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report)
+                merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, None, mft_options)
             }
             Err(e) => report.fail(format!("{}: {}", dir_path.display(), e)),
         }
@@ -553,6 +626,24 @@ fn sniff_file(path: &Path) -> std::io::Result<Sniffed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(name: &str) -> TimelineEntry {
+        TimelineEntry::new("2024-01-01T00:00:00Z".into(), 1_704_067_200, 0, 1, "m...".into(), "-".into(), 0, 0, "1".into(), name.into())
+    }
+
+    #[test]
+    fn stamp_builds_evidence_from_the_inside_out() {
+        let mut rows = vec![row("a"), row("b")];
+        stamp(&mut rows, Some("p2:$MFT"), Some("p2"), None);
+        stamp(&mut rows, Some("disk.E01"), Some("C:"), Some("srv01"));
+        stamp(&mut rows, Some("case"), None, Some("other"));
+        for r in &rows {
+            assert_eq!(r.evidence.as_deref(), Some("case:disk.E01:p2:$MFT"));
+            assert_eq!(r.volume.as_deref(), Some("p2"), "the innermost volume stays");
+            assert_eq!(r.host.as_deref(), Some("srv01"), "the first host given stays");
+        }
+        assert!(Arc::ptr_eq(rows[0].evidence.as_ref().unwrap(), rows[1].evidence.as_ref().unwrap()), "shared, not one string per row");
+    }
 
     #[test]
     fn test_usn_names() {

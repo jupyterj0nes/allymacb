@@ -111,8 +111,12 @@ fn deleted_record_never_overwrites_live_file_with_same_path() {
     let mut m = base_records();
     m.extend(record(6, 0, &[si(FT), fname(5, "dup.txt", 0, FT), data("", b"OLD-DELETED-CONTENT")])); // unallocated
     m.extend(record(7, 1, &[si(FT), fname(5, "dup.txt", 0, FT), data("", b"NEW")]));
-    let (_t, st) = parse_mft_reader(Cursor::new(m), &opts(Some(base.clone()))).unwrap();
+    let (t, st) = parse_mft_reader(Cursor::new(m), &opts(Some(base.clone()))).unwrap();
     assert_eq!(st.total_extracted, 3); // $MFT "x" + both dup.txt variants
+    // Same name in the timeline; the deleted column tells them apart.
+    let dup: Vec<_> = t.iter().filter(|e| e.file_name.ends_with(r"\dup.txt")).collect();
+    assert!(dup.iter().any(|e| e.meta == "6" && e.deleted == "unallocated"), "{:?}", dup);
+    assert!(dup.iter().any(|e| e.meta == "7" && e.deleted.is_empty()), "{:?}", dup);
     assert_eq!(std::fs::read_to_string(base.join("dup.txt")).unwrap(), "NEW");
     assert_eq!(std::fs::read_to_string(base.join("dup.txt.deleted_rec6")).unwrap(), "OLD-DELETED-CONTENT");
     let _ = std::fs::remove_dir_all(&base);

@@ -91,8 +91,8 @@ fn csv_writer_neutralises_formula_filenames_and_escapes_every_column() {
     let text = fs::read_to_string(&out).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], CSV_HEADER);
-    assert_eq!(lines[1], "2024-01-01T00:00:00Z,10,m...,-rw-r--r--,0,0,\"4230,evil\",\"'=cmd|' /C calc'!A0\",unknown,");
-    assert_eq!(lines[2], "2024-01-01T00:00:01Z,10,m...,-rw-r--r--,0,0,1,\"'@SUM(A1:A9)\",unknown,");
+    assert_eq!(lines[1], "2024-01-01T00:00:00Z,,,m...,unknown,0,0,,10,-rw-r--r--,,\"4230,evil\",\"'=cmd|' /C calc'!A0\",,,,,,");
+    assert_eq!(lines[2], "2024-01-01T00:00:01Z,,,m...,unknown,0,0,,10,-rw-r--r--,,1,\"'@SUM(A1:A9)\",,,,,,");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -154,7 +154,8 @@ fn cli_sniffs_bodyfile_content_from_unnamed_file() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("/etc/passwd"));
-    assert!(!stdout.contains("collection.dat"), "must not fall back to host metadata of the file");
+    assert!(!stdout.contains(",fs,"), "must not fall back to host metadata of the file");
+    assert!(stdout.lines().skip(1).all(|l| l.contains(",collection.dat,")), "the input is named in evidence: {}", stdout);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -167,7 +168,8 @@ fn directory_scan_picks_up_loose_bodyfile_and_usn() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("/etc/passwd"), "{}", stdout);
-    assert!(!stdout.contains("bodyfile.txt"), "the bodyfile itself must not be timelined as a loose file");
+    assert!(!stdout.contains(",fs,"), "the bodyfile itself must not be timelined as a loose file");
+    assert!(stdout.lines().skip(1).all(|l| l.contains(":uac/bodyfile/bodyfile.txt,")), "evidence: the directory, then the path inside it: {}", stdout);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -195,7 +197,7 @@ fn archive_without_artifacts_uses_archive_mtimes_only_and_no_temp_root_rows() {
     let rows: Vec<&str> = stdout.lines().skip(1).collect();
     assert!(!rows.is_empty());
     for r in &rows {
-        assert!(r.contains("[loose.zip]\\docs"), "only archive members, no temp-dir root rows: {}", r);
+        assert!(r.contains(",docs") && r.contains(",loose.zip,") && !r.contains("allymacb_"), "only archive members, no temp-dir root rows: {}", r);
         assert!(r.contains(",m...,"), "only modification-time rows from the archive: {}", r);
     }
     assert!(rows.iter().any(|r| r.starts_with("2001-09-09T01:46:40Z")), "mtime comes from the zip entry: {:?}", rows);

@@ -13,8 +13,9 @@ use mft::MftParser;
 
 use crate::anomaly;
 use crate::error::{AllyError, ErrorCode, Result};
+use crate::hunt;
 use crate::timefmt::{format_unix_timestamp, SECS_BETWEEN_1601_AND_1970};
-use crate::timeline::{join_macb_flags, source, TimelineEntry};
+use crate::timeline::{deleted, join_macb_flags, source, TimelineEntry};
 
 /// MFT record number of the volume root directory.
 pub(crate) const ROOT_RECORD: u64 = 5;
@@ -402,6 +403,10 @@ pub(crate) fn best_name(fns: &[FileNameAttr]) -> Option<FileNameAttr> {
 /// record came from (live `$MFT` or carved from raw sectors).
 pub(crate) struct RowSpec<'a> {
     pub entry_id: u64,
+    /// Sequence number from the record header.
+    pub sequence: u16,
+    /// Hunt volume the record belongs to (see [`crate::hunt::new_volume`]).
+    pub volume: u32,
     pub is_dir: bool,
     pub is_allocated: bool,
     /// Full path including the drive prefix, e.g. `C:\dir\file.txt`.
@@ -426,7 +431,7 @@ pub(crate) fn record_rows(
     out: &mut Vec<TimelineEntry>,
 ) {
     let base_mode = if spec.is_dir { "d/drwxrwxrwx" } else { "-/-rwxrwxrwx" };
-    let status_flag = if spec.is_allocated { "" } else { " (deleted)" };
+    let deleted = if spec.is_allocated { "" } else { deleted::UNALLOCATED };
     let fn_size = fn_attrs.iter().map(|f| f.logical_size).find(|&s| s > 0).unwrap_or(0);
     let file_size = data_size.unwrap_or(fn_size);
     let meta = spec.entry_id.to_string();
@@ -446,6 +451,17 @@ pub(crate) fn record_rows(
         }
     }
     let flags = anomaly::column(&indicators);
+    let hunt = std_info.map(|si| {
+        hunt::record(
+            spec.volume,
+            hunt::Evidence::Ntfs {
+                entry: spec.entry_id,
+                seq: spec.sequence,
+                si: hunt::si_macb(si),
+                fns: fn_attrs.iter().map(hunt::fn_macb).collect(),
+            },
+        )
+    });
 
     if let Some(info) = std_info {
         let mut collector = TimestampCollector::new();
@@ -456,7 +472,7 @@ pub(crate) fn record_rows(
 
         for ((secs, nanos), macb) in collector.entries {
             if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
-                let full_name = format!("{}{}{}", spec.resolved_path, status_flag, spec.suffix);
+                let full_name = format!("{}{}", spec.resolved_path, spec.suffix);
                 out.push(
                     TimelineEntry::new(
                         ts_iso.clone(),
@@ -471,13 +487,15 @@ pub(crate) fn record_rows(
                         full_name,
                     )
                     .with_source(spec.source)
-                    .with_flags(flags.clone()),
+                    .with_deleted(deleted)
+                    .with_flags(flags.clone())
+                    .with_hunt(hunt.clone()),
                 );
 
                 // ADS share the record's $STANDARD_INFORMATION timestamps,
                 // so they carry the same MACB flags.
                 for (stream_name, stream_size) in ads_streams {
-                    let ads_full_name = format!("{}:{}{}{}", spec.resolved_path, stream_name, status_flag, spec.suffix);
+                    let ads_full_name = format!("{}:{}{}", spec.resolved_path, stream_name, spec.suffix);
                     out.push(
                         TimelineEntry::new(
                             ts_iso.clone(),
@@ -492,7 +510,9 @@ pub(crate) fn record_rows(
                             ads_full_name,
                         )
                         .with_source(spec.source)
-                        .with_flags(flags.clone()),
+                        .with_deleted(deleted)
+                        .with_flags(flags.clone())
+                        .with_hunt(hunt.clone()),
                     );
                 }
             }
@@ -510,8 +530,8 @@ pub(crate) fn record_rows(
             for ((secs, nanos), macb) in collector.entries {
                 if let Some(ts_iso) = format_unix_timestamp(secs, nanos) {
                     let fn_full_name = format!(
-                        "{}{} ($FILE_NAME: {}){}",
-                        spec.resolved_path, status_flag, fn_attr.name, spec.suffix
+                        "{} ($FILE_NAME: {}){}",
+                        spec.resolved_path, fn_attr.name, spec.suffix
                     );
                     let fn_row_size = if fn_attr.logical_size > 0 { fn_attr.logical_size } else { file_size };
                     out.push(
@@ -528,7 +548,9 @@ pub(crate) fn record_rows(
                             fn_full_name,
                         )
                         .with_source(spec.source)
-                        .with_flags(flags.clone()),
+                        .with_deleted(deleted)
+                        .with_flags(flags.clone())
+                        .with_hunt(hunt.clone()),
                     );
                 }
             }
@@ -595,6 +617,7 @@ pub fn parse_mft_reader<R: Read + Seek>(
     let mut resident_stats = ResidentStats::default();
     let drive_prefix = options.drive_letter.unwrap_or('C');
     let mut resolver = PathResolver::new(skipped);
+    let hunt_volume = hunt::new_volume();
 
     for entry_idx in 0..entry_count {
         if let Some(ref pb) = pb {
@@ -644,6 +667,8 @@ pub fn parse_mft_reader<R: Read + Seek>(
 
         let spec = RowSpec {
             entry_id,
+            sequence: entry.header.sequence,
+            volume: hunt_volume,
             is_dir,
             is_allocated,
             resolved_path: &resolved_path,

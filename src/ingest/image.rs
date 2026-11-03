@@ -379,12 +379,18 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
     // NTFS volumes found, with their live $MFT kept on disk for the carver.
     let mut volumes: Vec<VolumeContext> = Vec::new();
     let mut failures = 0usize;
-    for part in partitions {
+    for (n, part) in partitions.into_iter().enumerate() {
+        // `p1`, `p2`...: the partition in the `volume` column, and in front of
+        // `evidence`, in the order the partitions were found.
+        let part_label = format!("p{}", n + 1);
+        let vol_label: Option<Arc<str>> = Some(Arc::from(part_label.as_str()));
         match part.ptype {
             PartitionType::Ntfs => {
                 let mut offset_reader = OffsetReader::new(&mut reader, part.offset);
                 match extract_and_parse_ntfs(&mut offset_reader, mft_options, temp_dir, mft_options.carve) {
-                    Ok(parsed) => {
+                    Ok(mut parsed) => {
+                        let hunt_volume = parsed.timeline.iter().find_map(|e| e.hunt.as_ref()).map(|h| h.volume);
+                        super::stamp(&mut parsed.timeline, Some(&format!("{}:$MFT", part_label)), Some(&part_label), None);
                         combined_timeline.extend(parsed.timeline);
                         total_stats.total_extracted += parsed.stats.total_extracted;
                         total_stats.total_bytes += parsed.stats.total_bytes;
@@ -398,13 +404,15 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                             live_mft: parsed.mft_dump,
                             free_ranges,
                             free_known,
+                            hunt_volume,
+                            label: vol_label.clone(),
                         });
                     }
                     Err(e) => {
                         failures += 1;
                         eprintln!("[!] NTFS partition @0x{:X} in {}: {}", part.offset, label, e);
                         // Still carve the range; parents just cannot be checked against a live table.
-                        volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false });
+                        volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false, hunt_volume: None, label: vol_label.clone() });
                     }
                 }
             }
@@ -414,7 +422,8 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                 // for layouts the raw reader does not handle.
                 let raw = crate::parsers::ext4raw::parse_ext4_raw(&mut reader, part.offset, mft_options.carve);
                 match raw {
-                    Ok((timeline, rep)) => {
+                    Ok((mut timeline, rep)) => {
+                        super::stamp(&mut timeline, Some(&part_label), Some(&part_label), None);
                         if !mft_options.quiet {
                             eprintln!("    [+] ext4 @0x{:X}: {}", part.offset, crate::parsers::ext4raw::describe(&rep, mft_options.carve));
                         }
@@ -423,8 +432,8 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                             // Free space of the volume, so log lines and utmp
                             // records are carved only from unallocated blocks.
                             match crate::parsers::ext4raw::free_space(&mut reader, part.offset) {
-                                Some(((start, end), free)) => volumes.push(VolumeContext { start, end, live_mft: None, free_ranges: free, free_known: true }),
-                                None => volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false }),
+                                Some(((start, end), free)) => volumes.push(VolumeContext { start, end, live_mft: None, free_ranges: free, free_known: true, hunt_volume: None, label: vol_label.clone() }),
+                                None => volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false, hunt_volume: None, label: vol_label.clone() }),
                             }
                         }
                         continue;
@@ -435,7 +444,10 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                 }
                 let reader_arc = Arc::new(Mutex::new(reader));
                 match parse_ext4_partition(reader_arc.clone(), part.offset) {
-                    Ok(timeline) => combined_timeline.extend(timeline),
+                    Ok(mut timeline) => {
+                        super::stamp(&mut timeline, Some(&part_label), Some(&part_label), None);
+                        combined_timeline.extend(timeline)
+                    }
                     Err(e) => {
                         failures += 1;
                         eprintln!("[!] ext4 partition @0x{:X} in {}: {}", part.offset, label, e);
@@ -476,7 +488,11 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
             }
         }
         match carved {
-            Ok((entries, stats)) => {
+            Ok((mut entries, stats)) => {
+                // A carved row names the partition it was found in, if any.
+                for e in &mut entries {
+                    e.evidence = e.volume.clone();
+                }
                 if !mft_options.quiet {
                     eprintln!("    [+] Carving: {} ({} rows)", describe_stats(&stats), entries.len());
                 }

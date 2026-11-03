@@ -19,12 +19,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::anomaly;
 use crate::error::{AllyError, ErrorCode, Result};
+use crate::hunt::{self, HuntRecord};
 use crate::parsers::ext4::mode_bits_to_string;
 use crate::timefmt::format_unix_timestamp;
-use crate::timeline::{join_macb_flags, source, TimelineEntry};
+use crate::timeline::{deleted, join_macb_flags, source, TimelineEntry};
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const ROOT_INODE: u32 = 2;
@@ -105,6 +107,17 @@ impl Inode {
     }
     pub fn is_deleted(&self) -> bool {
         self.is_used() && (self.dtime != 0 || self.links == 0)
+    }
+    /// The `deleted` column: `dtime` when the kernel stamped the deletion,
+    /// `unallocated` for an inode left with no links, empty when live.
+    pub fn deleted_kind(&self) -> &'static str {
+        if !self.is_deleted() {
+            ""
+        } else if self.dtime != 0 {
+            deleted::DTIME
+        } else {
+            deleted::UNALLOCATED
+        }
     }
     /// `ls -l` style mode with the type character.
     pub fn mode_string(&self) -> String {
@@ -659,9 +672,17 @@ impl<R: Read + Seek> Ext4Raw<R> {
     }
 }
 
+/// Sets the `deleted` column of the rows just built for inode state `i`.
+fn mark_deleted(rows: &mut [TimelineEntry], i: &Inode) {
+    let kind = i.deleted_kind();
+    for r in rows {
+        r.deleted = kind;
+    }
+}
+
 /// Rows for one inode state; `name` is the full path with tags, `suffix`
 /// goes after it.
-fn rows_for(i: &Inode, name: &str, src: &'static str, flags: &str, out: &mut Vec<TimelineEntry>) {
+fn rows_for(i: &Inode, name: &str, src: &'static str, flags: &str, hunt: &Option<Arc<HuntRecord>>, out: &mut Vec<TimelineEntry>) {
     let mut ts_map: HashMap<Ts, String> = HashMap::new();
     for (t, f) in [(i.mtime, 'm'), (i.atime, 'a'), (i.ctime, 'c')] {
         if t != (0, 0) {
@@ -681,9 +702,19 @@ fn rows_for(i: &Inode, name: &str, src: &'static str, flags: &str, out: &mut Vec
             out.push(
                 TimelineEntry::new(iso, secs, nanos, i.size, macb, mode.clone(), i.uid, i.gid, i.num.to_string(), name.to_string())
                     .with_source(src)
-                    .with_flags(flags.to_string()),
+                    .with_flags(flags.to_string())
+                    .with_hunt(hunt.clone()),
             );
         }
+    }
+}
+
+fn unix_macb(i: &Inode) -> hunt::Macb {
+    hunt::Macb {
+        m: hunt::unix_ts(i.mtime),
+        a: hunt::unix_ts(i.atime),
+        c: hunt::unix_ts(i.ctime),
+        b: i.crtime.and_then(hunt::unix_ts),
     }
 }
 
@@ -721,6 +752,9 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
     let mut fs = Ext4Raw::open(reader, base)?;
     let mut report = Ext4RawReport::default();
     let mut out = Vec::new();
+    let volume = hunt::new_volume();
+    // One hunt record per inode state, shared by every path (hard links) of it.
+    let hunt_of = |i: &Inode| Some(hunt::record(volume, hunt::Evidence::Unix { inode: u64::from(i.num), t: unix_macb(i) }));
 
     // --- live tree ----------------------------------------------------------
     let live = fs.walk()?;
@@ -729,10 +763,12 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
         live_paths.entry(*ino).or_default().push(path.clone());
     }
     let mut live_inodes: HashMap<u32, Inode> = HashMap::new();
+    let mut live_hunt: HashMap<u32, Option<Arc<HuntRecord>>> = HashMap::new();
     for (ino, path) in &live {
         let Some(i) = live_inodes.get(ino).cloned().or_else(|| fs.inode(*ino)) else { continue };
         live_inodes.entry(*ino).or_insert_with(|| i.clone());
-        rows_for(&i, path, source::EXT4, &indicators(&i, path, &[]), &mut out);
+        let h = live_hunt.entry(*ino).or_insert_with(|| hunt_of(&i));
+        rows_for(&i, path, source::EXT4, &indicators(&i, path, &[]), h, &mut out);
         report.live_entries += 1;
     }
 
@@ -744,8 +780,10 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
 
     if !carve {
         for i in &deleted {
-            let name = format!("/[UNKNOWN]/inode_{} (deleted)", i.num);
-            rows_for(i, &name, source::EXT4, &indicators(i, &name, &[]), &mut out);
+            let name = format!("/[UNKNOWN]/inode_{}", i.num);
+            let from = out.len();
+            rows_for(i, &name, source::EXT4, &indicators(i, &name, &[]), &hunt_of(i), &mut out);
+            mark_deleted(&mut out[from..], i);
         }
         return Ok((out, report));
     }
@@ -815,8 +853,9 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
     let mut rows = Vec::new();
     for i in &deleted {
         let path = name_at(i.num, u32::MAX, &jnames, &live_paths, 0, &mut HashSet::new()).unwrap_or_else(|| format!("/[UNKNOWN]/inode_{}", i.num));
-        let name = format!("{} (deleted)", path);
-        rows_for(i, &name, source::EXT4, &indicators(i, &name, &[]), &mut rows);
+        let from = rows.len();
+        rows_for(i, &path, source::EXT4, &indicators(i, &path, &[]), &hunt_of(i), &mut rows);
+        mark_deleted(&mut rows[from..], i);
     }
 
     // Older states: dedupe against the live inode and across copies.
@@ -841,9 +880,10 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
         if path.is_empty() {
             path = "/".to_string();
         }
-        let status = if st.is_deleted() { " (deleted)" } else { "" };
-        let name = format!("{}{} (carved @0x{:X})", path, status, offset);
-        rows_for(st, &name, source::CARVED, &indicators(st, &name, &extra), &mut rows);
+        let name = format!("{} (carved @0x{:X})", path, offset);
+        let from = rows.len();
+        rows_for(st, &name, source::CARVED, &indicators(st, &name, &extra), &hunt_of(st), &mut rows);
+        mark_deleted(&mut rows[from..], st);
     }
     report.backdated = backdated.len();
     for e in out.iter_mut() {
@@ -857,7 +897,7 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
     // Row-level dedupe: a carved row that repeats a live row says nothing new.
     let key = |e: &TimelineEntry| {
         let n = e.file_name.rfind(" (carved @0x").map_or(e.file_name.as_str(), |i| &e.file_name[..i]);
-        (e.timestamp_secs, e.timestamp_nanos, e.macb.clone(), e.size, e.meta.clone(), n.to_string())
+        (e.timestamp_secs, e.timestamp_nanos, e.macb.clone(), e.size, e.meta.clone(), n.to_string(), e.deleted)
     };
     let mut seen_rows: HashSet<_> = out.iter().map(key).collect();
     for r in rows {
