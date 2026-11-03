@@ -105,7 +105,7 @@ Anything skipped is reported: unreadable images, corrupt archives, rejected body
 
 ```csv
 time_created,host,action,type,source,uid,gid,volume,size,mode,deleted,meta,file_name,evidence,hunt,hunt_score,hunt_why,verdict,notes
-1991-10-03T02:25:06Z,uac_results_server01,,m...,bodyfile,0,0,,72834,-rw-r--r--,,8989,/usr/share/fonts/putb.pfa,uac_results_server01.tar.gz:bodyfile.txt,candidate,0,"rule m_before_b (medium): modification before creation",,
+1991-10-03T02:25:06Z,uac_results_server01,,m...,bodyfile,0,0,,72834,-rw-r--r--,,8989,/usr/share/fonts/putb.pfa,uac_results_server01.tar.gz:bodyfile.txt,,,rule m_before_b (medium): modification before creation,,
 2024-02-04T12:35:00Z,,,macb,mft,0,0,p2,1024,-/-rwxrwxrwx,,34567,C:\Windows\System32\cmd.exe,disk.E01:p2:$MFT,,,,,
 2024-02-04T12:35:00Z,,,macb,mft,0,0,p2,1024,-/-rwxrwxrwx,,34567,C:\Windows\System32\cmd.exe ($FILE_NAME: cmd.exe),disk.E01:p2:$MFT,,,,,
 2024-02-03T09:12:41Z,,,macb,carved,0,0,p2,1024,-/-rwxrwxrwx,unallocated,34567,C:\Windows\System32\cmd.exe (carved @0x1A2B3C00),disk.E01:p2,,,,,
@@ -114,7 +114,7 @@ time_created,host,action,type,source,uid,gid,volume,size,mode,deleted,meta,file_
 2001-01-01T00:00:00Z,,,macb,mft,0,0,C:,4096,-/-rwxrwxrwx,,45120,C:\Windows\Temp\payload.exe,$MFT,significant,34,"rule si_before_fn (high): $SI creation before the $FILE_NAME creation; rule si_subsec_zero (high): $SI times in whole seconds, the $FILE_NAME ones not; $SI creation before the $FILE_NAME creation; creation time in whole seconds",,
 ```
 
-The last two rows come from a run with `--investigation-from`. The last one has both voices: its rules (17 points, measured) and the statistical hunt (17 points) add up to 34. Without `--investigation-from`, a row with rules carries the state they give and their points; a row without any is left with an empty tail.
+The last two rows come from a run with `--investigation-from`. The last one has both voices: its rules (17 points, measured) and the statistical hunt (17 points) add up to 34. Without `--investigation-from`, a row with rules carries the state they give and their points; a row without any is left with an empty tail. The first row shows a rule measured common on its kind of record (`m_before_b` on Unix, see Hunting): it gives no state and no points, only its clause.
 
 The 19 columns are those of [masstin's timeline](https://github.com/jupyterj0nes/masstin/blob/main/docs/csv-format.md), each in the position of the masstin column closest in meaning, so a timeline of each read side by side keeps the same kind of value in the same column:
 
@@ -163,7 +163,7 @@ Orphans: an NTFS parent reference carries the sequence number of the directory r
 
 These are allymacb's static rules: a known pattern, with no probability behind it. When a file's timestamps or name show one, every row of the file says so in the analysis tail, in the convention the four tools share:
 
-* **Level.** An indicator is `high` when it has no ordinary explanation, and so is the pair `si_before_fn` with `si_subsec_zero` (the classic timestomp signature); the patterns that installers and preserved-timestamp copies also produce are `medium`. A high rule puts `significant` in `hunt`, a medium one `candidate`; a stronger statistical state keeps its place.
+* **Level.** An indicator is `high` when it has no ordinary explanation, and so is the pair `si_before_fn` with `si_subsec_zero` (the classic timestomp signature); the patterns that installers and preserved-timestamp copies also produce are `medium`. A high rule puts `significant` in `hunt`, a medium one `candidate`; a stronger statistical state keeps its place. A rule measured below 10 points on the record's kind (it fires on more than one clean record in ten) is noise there: no state, no points, the clause only. The level is the author's opinion; the measurement decides.
 * **`hunt_why`** has one clause per indicator, `rule <id> (<level>): <what it means>`, strongest first, before the hunt's own words.
 * **`hunt_score`** gets the rule's rarity on masstin's scale, measured, not chosen: `10 · log10(records / records that fire)` on a reference volume of the record's kind: for NTFS the `$MFT` of the NIST Hacking Case (12,183 file records of a Windows XP install, nearly all stock files and two setup programs); for Unix records a stock Ubuntu ext4 volume of a lab host (861 inodes, read from the on-disk structures). A pattern that never fired on the reference is not "never": it gets the bound the volume gives, one in `records + 1` (41 on the NTFS reference, 29 on the ext4 one). A rule not measured yet adds 0 and its clause ends with `rarity not measured`. Test and rules add, capped at 100.
 

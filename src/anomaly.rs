@@ -249,6 +249,11 @@ const MEASURED_ON_EXT4: f64 = 861.0;
 /// records, the scale of the four tools: `10 · log10(records / hits)`. A
 /// pattern that never fired gets the bound the corpus gives, one in
 /// `records + 1` (41 on the NTFS reference, 29 on the ext4 one).
+/// A rule measured below this many points fires on more than one clean
+/// record in ten: noise on that kind of record, it gives no state and no
+/// points, only its clause (the convention of the four tools).
+pub const NOISE_BELOW: u32 = 10;
+
 fn rarity(hits: f64, records: f64) -> u32 {
     let (h, n) = if hits <= 0.0 { (1.0, records + 1.0) } else { (hits, records) };
     (10.0 * (n / h).log10()).round().max(0.0) as u32
@@ -295,8 +300,10 @@ const PAIR_POINTS: u32 = 17;
 /// What the rules of one record put in the tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rules {
-    /// The strongest level among the indicators.
-    pub severity: Severity,
+    /// The strongest level among the indicators that count: a rule measured
+    /// common (below `NOISE_BELOW` points) gives no level. None when every
+    /// indicator of the record is noise.
+    pub severity: Option<Severity>,
     /// `hunt_score` points, 0 where none is measured.
     pub points: u32,
     /// One clause per indicator, strongest first, separated by `; `:
@@ -319,19 +326,26 @@ impl Rules {
     /// on NTFS only). `None` when there is no indicator.
     pub fn of(column: &str, ntfs: bool) -> Option<Rules> {
         let flags = parse_column(column);
-        let severity = severity(&flags)?;
+        severity(&flags)?;
         let mut sorted: Vec<(Severity, &str)> = flags.iter().map(|f| (level(f, &flags), *f)).collect();
         sorted.sort_by_key(|s| std::cmp::Reverse(s.0));
         let pair = ntfs && flags.contains(&SI_BEFORE_FN) && flags.contains(&SI_SUBSEC_ZERO);
         let mut total = if pair { PAIR_POINTS } else { 0 };
+        let mut severity: Option<Severity> = None;
         let mut why = Vec::with_capacity(sorted.len());
         for (lvl, f) in sorted {
             let word = if lvl == Severity::Alert { "high" } else { "medium" };
             let text = describe(f);
             let text = if text.is_empty() { f } else { text };
-            match points(f, ntfs) {
+            let p = points(f, ntfs);
+            // measured common: no level, no points, the clause only
+            let counts = p.is_none_or(|p| p >= NOISE_BELOW) || (pair && (f == SI_BEFORE_FN || f == SI_SUBSEC_ZERO));
+            if counts {
+                severity = Some(severity.map_or(lvl, |s| s.max(lvl)));
+            }
+            match p {
                 Some(p) => {
-                    if !(pair && (f == SI_BEFORE_FN || f == SI_SUBSEC_ZERO)) {
+                    if counts && !(pair && (f == SI_BEFORE_FN || f == SI_SUBSEC_ZERO)) {
                         total += p;
                     }
                     why.push(format!("rule {f} ({word}): {text}"));
@@ -391,26 +405,27 @@ mod tests {
     fn rules_in_the_tail() {
         assert_eq!(Rules::of("", true), None);
         let r = Rules::of("WARN: si_before_fn", true).unwrap();
-        assert_eq!(r, Rules { severity: Severity::Warn, points: 16, why: "rule si_before_fn (medium): $SI creation before the $FILE_NAME creation".into() });
+        assert_eq!(r, Rules { severity: Some(Severity::Warn), points: 16, why: "rule si_before_fn (medium): $SI creation before the $FILE_NAME creation".into() });
         let r = Rules::of("ALERT: si_before_fn+si_subsec_zero", true).unwrap();
-        assert_eq!(r.severity, Severity::Alert);
+        assert_eq!(r.severity, Some(Severity::Alert));
         assert_eq!(r.points, 17, "the pair is measured as one pattern");
         assert!(r.why.starts_with("rule si_before_fn (high): ") && r.why.contains("; rule si_subsec_zero (high): "), "{}", r.why);
         // Strongest first; points add.
         let r = Rules::of("ALERT: b_after_c+future", true).unwrap();
         assert_eq!(r.points, 17 + 41);
         assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule b_after_c (medium): $SI creation after the record change time"), "{}", r.why);
-        // Unix: m_before_b fires on 97 % of a stock ext4 volume, so it is worth 0.
+        // Unix: m_before_b fires on 97 % of a stock ext4 volume: noise, no level, no points.
         let r = Rules::of("WARN: m_before_b", false).unwrap();
-        assert_eq!(r.points, 0);
-        assert_eq!(r.why, "rule m_before_b (medium): modification before creation");
-        assert_eq!(Rules::of("ALERT: future", false).unwrap().points, 29, "the bound 861 inodes give");
+        assert_eq!(r, Rules { severity: None, points: 0, why: "rule m_before_b (medium): modification before creation".into() });
+        let r = Rules::of("ALERT: m_before_b+future", false).unwrap();
+        assert_eq!((r.severity, r.points), (Some(Severity::Alert), 29), "the bound 861 inodes give; the noise adds nothing");
+        assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule m_before_b (medium): modification before creation"), "{}", r.why);
         assert_eq!(rarity(0.0, 12_183.0), 41);
         assert_eq!(rarity(1.0, 128.0), 21);
         assert_eq!(rarity(835.0, 861.0), 0);
         // Not measured: no points, and the clause says so.
         let r = Rules::of("ALERT: usn_basic_info", true).unwrap();
-        assert_eq!(r.points, 0);
+        assert_eq!((r.severity, r.points), (Some(Severity::Alert), 0), "unmeasured is not noise: it keeps its level");
         assert!(r.why.ends_with(", rarity not measured"), "{}", r.why);
         assert_eq!(ids(&[B_AFTER_C, FUTURE]), "future (high)+b_after_c (medium)");
         assert_eq!(ids(&[]), "");

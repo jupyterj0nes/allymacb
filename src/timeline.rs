@@ -254,7 +254,7 @@ fn rule_state(severity: Severity) -> State {
 /// masstin's six words ever go in it.
 pub fn hunt_word(entry: &TimelineEntry) -> &'static str {
     let state = entry.mark.as_ref().map(|m| m.state);
-    let rule = rules(entry).map(|r| rule_state(r.severity));
+    let rule = rules(entry).and_then(|r| r.severity).map(rule_state);
     strongest(state, rule).map(State::as_str).unwrap_or("")
 }
 
@@ -273,15 +273,18 @@ const EMPTY_TAIL: &str = ",,,,,";
 fn tail(entry: &TimelineEntry) -> String {
     let mark = entry.mark.as_deref();
     let rules = rules(entry);
-    let Some(state) = strongest(mark.map(|m| m.state), rules.as_ref().map(|r| rule_state(r.severity))) else {
+    let state = strongest(mark.map(|m| m.state), rules.as_ref().and_then(|r| r.severity).map(rule_state));
+    if state.is_none() && rules.is_none() {
         return EMPTY_TAIL.to_string();
-    };
+    }
+    // a record where only noise rules fired and no test spoke: no state, no score, the clause
+    let state = state.map(State::as_str).unwrap_or("");
     // Test and rules add, capped at masstin's top.
     let score = match (mark.and_then(|m| m.score), &rules) {
         (s, Some(r)) => Some((u32::from(s.unwrap_or(0)) + r.points).min(u32::from(SCORE_MAX))),
         (s, None) => s.map(u32::from),
     };
-    let score = score.map(|s| s.to_string()).unwrap_or_default();
+    let score = score.filter(|_| !state.is_empty()).map(|s| s.to_string()).unwrap_or_default();
     let test = mark.map(|m| m.why.as_str()).filter(|w| !w.is_empty());
     let why = match (rules.map(|r| r.why), test) {
         (Some(r), Some(t)) => format!("{}; {}", r, t),
@@ -289,7 +292,7 @@ fn tail(entry: &TimelineEntry) -> String {
         (None, Some(t)) => t.to_string(),
         (None, None) => String::new(),
     };
-    format!(",{},{},{},,", state.as_str(), score, escape_csv_text(&why))
+    format!(",{},{},{},,", state, score, escape_csv_text(&why))
 }
 
 fn opt(v: &Option<Arc<str>>) -> &str {
@@ -451,14 +454,20 @@ mod tests {
         assert!(row.ends_with(",significant,100,\"rule future (high): a timestamp more than a day after the timeline was built; rule pre_1980 (high): a timestamp before 1980; a, b; c\",,"), "{}", row);
         e.mark = Some(Arc::new(Mark { state: State::Candidate, score: Some(9), why: "c".into() }));
         assert!(format_csv_row(&e).contains(",significant,91,rule future (high): "));
-        // A medium rule on a Unix record: candidate; m_before_b is worth 0 on ext4 (fires on 97 % of stock inodes).
+        // A medium rule on a Unix record: m_before_b fires on 97 % of stock inodes, so it is noise
+        // there: the test's state and score stand, the clause stays.
         let mut u = e.clone().with_source(source::EXT4);
         u.flags = "WARN: m_before_b".into();
         assert!(format_csv_row(&u).ends_with(",candidate,9,rule m_before_b (medium): modification before creation; c,,"), "{}", format_csv_row(&u));
         u.mark = Some(Arc::new(Mark { state: State::Habitual, score: Some(0), why: String::new() }));
-        assert!(format_csv_row(&u).ends_with(",candidate,0,rule m_before_b (medium): modification before creation,,"));
+        assert!(format_csv_row(&u).ends_with(",habitual,0,rule m_before_b (medium): modification before creation,,"), "{}", format_csv_row(&u));
         u.mark = None;
-        assert!(format_csv_row(&u).ends_with(",candidate,0,rule m_before_b (medium): modification before creation,,"));
+        assert!(format_csv_row(&u).ends_with(",,,rule m_before_b (medium): modification before creation,,"), "{}", format_csv_row(&u));
+        // The same rule on NTFS is not measured: it keeps its level.
+        let mut n = e.clone().with_source(source::MFT);
+        n.mark = None;
+        n.flags = "WARN: m_before_b".into();
+        assert!(format_csv_row(&n).ends_with(",candidate,0,\"rule m_before_b (medium): modification before creation, rarity not measured\",,"), "{}", format_csv_row(&n));
         // The test alone.
         e.flags.clear();
         assert!(format_csv_row(&e).ends_with(",candidate,9,c,,"));
