@@ -235,35 +235,57 @@ fn level(flag: &str, flags: &[&str]) -> Severity {
     }
 }
 
-/// Records of the reference volume the rule rarities were measured on: the
-/// `$MFT` of the NIST Hacking Case (Windows XP, mostly stock files and two
-/// installers), one record per file.
+/// Records of the NTFS reference volume the rule rarities were measured on:
+/// the `$MFT` of the NIST Hacking Case (Windows XP, mostly stock files and
+/// two installers), one record per file.
 const MEASURED_ON: f64 = 12_183.0;
 
-/// `hunt_score` points of an indicator on an NTFS record, masstin's scale
-/// measured, not chosen: `10 · log10(records / records that fire)` on the
-/// reference volume. `None` where it is not measured yet (the Unix rules, the
-/// USN and carving ones, and every rule on a Unix record).
+/// Inodes of the Unix reference volume: a stock Ubuntu ext4 volume of a lab
+/// host acquired in October 2026 (`real_ext4.img`, 256 MB), one record per
+/// inode, read from the on-disk structures.
+const MEASURED_ON_EXT4: f64 = 861.0;
+
+/// Points of a pattern that fired `hits` times on `records` reference
+/// records, the scale of the four tools: `10 · log10(records / hits)`. A
+/// pattern that never fired gets the bound the corpus gives, one in
+/// `records + 1` (41 on the NTFS reference, 29 on the ext4 one).
+fn rarity(hits: f64, records: f64) -> u32 {
+    let (h, n) = if hits <= 0.0 { (1.0, records + 1.0) } else { (hits, records) };
+    (10.0 * (n / h).log10()).round().max(0.0) as u32
+}
+
+/// `hunt_score` points of an indicator, masstin's scale measured, not
+/// chosen: `10 · log10(records / records that fire)` on the reference volume
+/// of the record's kind (NTFS: the NIST `$MFT`; Unix: the ext4 volume).
+/// `None` where it is not measured yet (the USN and carving rules, and the
+/// names on Unix).
 ///
-/// | rule | fired on | points |
-/// |---|---|---|
-/// | `si_before_fn` | 324 | 16 |
-/// | `si_subsec_zero` | 236 | 17 |
-/// | `si_before_fn` with `si_subsec_zero` | 232 | 17 for the pair |
-/// | `b_after_c` | 220 | 17 |
-/// | `future`, `pre_1980`, names | none | 41, one in 12,183 or rarer |
+/// | rule | NTFS, of 12,183 | points | ext4, of 861 | points |
+/// |---|---|---|---|---|
+/// | `si_before_fn` | 324 | 16 | | |
+/// | `si_subsec_zero` | 236 | 17 | | |
+/// | `si_before_fn` with `si_subsec_zero` | 232 | 17 for the pair | | |
+/// | `b_after_c` | 220 | 17 | | |
+/// | `m_before_b` | | | 835 (package files keep their build mtime, older than the install's crtime) | 0 |
+/// | `future`, `pre_1980` | none | 41 | none | 29 |
+/// | names | none | 41 | | |
 fn points(flag: &str, ntfs: bool) -> Option<u32> {
     if !ntfs {
-        return None;
+        let fired = match flag {
+            M_BEFORE_B => 835.0,
+            FUTURE | PRE_1980 => 0.0,
+            _ => return None,
+        };
+        return Some(rarity(fired, MEASURED_ON_EXT4));
     }
     let fired = match flag {
         SI_BEFORE_FN => 324.0,
         SI_SUBSEC_ZERO => 236.0,
         B_AFTER_C => 220.0,
-        FUTURE | PRE_1980 | RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT => 1.0,
+        FUTURE | PRE_1980 | RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT => 0.0,
         _ => return None,
     };
-    Some((10.0 * (MEASURED_ON / fired).log10()).round() as u32)
+    Some(rarity(fired, MEASURED_ON))
 }
 
 /// Points of `$SI` before `$FN` with whole-second `$SI` times: measured as a
@@ -378,11 +400,18 @@ mod tests {
         let r = Rules::of("ALERT: b_after_c+future", true).unwrap();
         assert_eq!(r.points, 17 + 41);
         assert!(r.why.starts_with("rule future (high): ") && r.why.ends_with("; rule b_after_c (medium): $SI creation after the record change time"), "{}", r.why);
-        // Not measured: no points, and the clause says so.
+        // Unix: m_before_b fires on 97 % of a stock ext4 volume, so it is worth 0.
         let r = Rules::of("WARN: m_before_b", false).unwrap();
         assert_eq!(r.points, 0);
-        assert_eq!(r.why, "rule m_before_b (medium): modification before creation, rarity not measured");
-        assert_eq!(Rules::of("ALERT: future", false).unwrap().points, 0, "measured on NTFS only");
+        assert_eq!(r.why, "rule m_before_b (medium): modification before creation");
+        assert_eq!(Rules::of("ALERT: future", false).unwrap().points, 29, "the bound 861 inodes give");
+        assert_eq!(rarity(0.0, 12_183.0), 41);
+        assert_eq!(rarity(1.0, 128.0), 21);
+        assert_eq!(rarity(835.0, 861.0), 0);
+        // Not measured: no points, and the clause says so.
+        let r = Rules::of("ALERT: usn_basic_info", true).unwrap();
+        assert_eq!(r.points, 0);
+        assert!(r.why.ends_with(", rarity not measured"), "{}", r.why);
         assert_eq!(ids(&[B_AFTER_C, FUTURE]), "future (high)+b_after_c (medium)");
         assert_eq!(ids(&[]), "");
         for f in [SI_BEFORE_FN, SI_SUBSEC_ZERO, B_AFTER_C, FUTURE, PRE_1980, M_BEFORE_B, M_AFTER_C, USN_BASIC_INFO, BACKDATED, RTLO_NAME, INVISIBLE_NAME, DOUBLE_EXT] {
