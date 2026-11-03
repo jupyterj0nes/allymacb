@@ -3,7 +3,9 @@ use std::time::Instant;
 use clap::Parser;
 
 use allymacb::anomaly;
+use allymacb::context;
 use allymacb::hunt;
+use allymacb::timeline;
 use allymacb::cli::Cli;
 use allymacb::ingest::process_evidence_inputs;
 use allymacb::parsers::mft::MftParseOptions;
@@ -33,14 +35,17 @@ fn print_banner() {
 const MAX_ALERT_LINES: usize = 40;
 
 /// Prints the anti-forensics findings: every file with an ALERT on its own
-/// line (capped), then one line of counts for the WARN-level indicators.
+/// line (capped), then one line of counts for the records the rules make
+/// `candidate`, then what the volume vouched for or folded.
 /// Always printed, quiet or not: an alert is not progress chatter.
-fn report_anomalies(timeline: &[TimelineEntry]) {
+fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContext]) {
     use std::collections::{BTreeMap, BTreeSet};
 
     // One entry per file: (meta, name without row tags) -> indicators.
     let mut alerts: BTreeMap<(String, String), BTreeSet<&str>> = BTreeMap::new();
     let mut warn_files: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut installed: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut folded: BTreeSet<(String, String)> = BTreeSet::new();
     for e in timeline {
         if e.flags.is_empty() {
             continue;
@@ -51,38 +56,61 @@ fn report_anomalies(timeline: &[TimelineEntry]) {
             None => base_name(&e.file_name),
         };
         let key = (e.meta.clone(), name);
-        match anomaly::severity(&flags) {
-            Some(anomaly::Severity::Alert) => {
+        match (e.context.as_deref(), timeline::hunt_word(e)) {
+            (Some(context::Context::Installed(_)), "baseline") => {
+                installed.insert(key);
+            }
+            (Some(context::Context::Burst { leader: false, .. }), "habitual") => {
+                folded.insert(key);
+            }
+            (_, "significant") => {
                 alerts.entry(key).or_default().extend(flags);
             }
-            Some(anomaly::Severity::Warn) => {
+            (_, "candidate") => {
                 for f in flags {
                     warn_files.entry(f).or_default().insert(key.clone());
                 }
             }
-            None => {}
+            _ => {}
         }
     }
 
     if !alerts.is_empty() {
         eprintln!();
-        eprintln!("[ALERT] {} file(s) with high-level rule indicators (timestomping, name tricks): `significant` in the hunt column, `rule <id> (high)` in hunt_why:", alerts.len());
+        eprintln!("[ALERT] {} file(s) `significant` by their rules (timestomping, name tricks), `rule <id> (high)` in hunt_why:", alerts.len());
         for ((meta, name), flags) in alerts.iter().take(MAX_ALERT_LINES) {
             let joined: Vec<&str> = flags.iter().copied().collect();
             eprintln!("[ALERT]   {:<34} {}  (meta {})", joined.join("+"), name, meta);
         }
         if alerts.len() > MAX_ALERT_LINES {
-            eprintln!("[ALERT]   ... and {} more; filter hunt_why for \"(high)\"", alerts.len() - MAX_ALERT_LINES);
+            eprintln!("[ALERT]   ... and {} more; filter hunt for significant and hunt_why for \"rule \"", alerts.len() - MAX_ALERT_LINES);
         }
     }
     if !warn_files.is_empty() {
         let detail: Vec<String> = warn_files.iter().map(|(f, s)| format!("{} {}", f, s.len())).collect();
         let total: BTreeSet<&(String, String)> = warn_files.values().flatten().collect();
         eprintln!(
-            "[!] {} file(s) with medium-level rule indicators ({}): also produced by preserved-timestamp copies and installers; `candidate` in the hunt column, `rule <id> (medium)` in hunt_why",
+            "[!] {} file(s) `candidate` by their rules ({}): also produced by preserved-timestamp copies and installers; `rule <id> (medium)` in hunt_why",
             total.len(),
             detail.join(", ")
         );
+    }
+    for v in volumes {
+        if let Some(w) = &v.install {
+            eprintln!("[*] {}: installed from {} to {}, {} of {} records", v.place, w.from, w.to, w.records, w.total);
+        }
+        if v.bursts > 0 {
+            eprintln!(
+                "[*] {}: {} burst(s) of records with the same rules changed in the same hour, more than their clean rate gives; the first of each keeps its state, the other {} are `habitual`",
+                v.place, v.bursts, v.folded
+            );
+        }
+    }
+    if !installed.is_empty() {
+        eprintln!("[*] {} file(s) installed with their volume: the rules that fired on them add nothing, `baseline` in the hunt column", installed.len());
+    }
+    if !folded.is_empty() {
+        eprintln!("[*] {} file(s) folded into a burst: `habitual`, `same burst as record` in hunt_why points at the first", folded.len());
     }
 }
 
@@ -231,12 +259,14 @@ fn main() -> ExitCode {
 
     let carved = report.timeline.iter().filter(|e| e.source == source::CARVED).count();
 
+    let volumes = context::attach(&mut report.timeline, args.alpha);
+
     let mut hunt_failed = false;
     if let Some(from) = cutoff {
         hunt_failed = !run_hunt(&mut report.timeline, from, &args);
     }
 
-    report_anomalies(&report.timeline);
+    report_anomalies(&report.timeline, &volumes);
 
     let count = match TimelineWriter::write_entries(&mut report.timeline, args.output.as_deref()) {
         Ok(c) => c,

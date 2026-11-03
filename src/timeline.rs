@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::anomaly::{Rules, Severity};
+use crate::context::Context;
 use crate::hunt::{HuntRecord, Mark, State, SCORE_MAX};
 
 /// Values of the `source` column: which kind of evidence a row was built from.
@@ -88,6 +89,10 @@ pub struct TimelineEntry {
     /// The hunt's verdict on that record, written in the analysis tail.
     /// None when the hunt did not run or the row did not enter it.
     pub mark: Option<Arc<Mark>>,
+    /// What the record's volume says about it (installed with the volume,
+    /// part of a burst; see [`crate::context`]). Written in the analysis
+    /// tail. None when the volume says nothing.
+    pub context: Option<Arc<Context>>,
 }
 
 impl TimelineEntry {
@@ -123,6 +128,7 @@ impl TimelineEntry {
             flags: String::new(),
             hunt: None,
             mark: None,
+            context: None,
         }
     }
 
@@ -234,10 +240,41 @@ pub const CSV_HEADER: &str = "time_created,host,action,type,source,uid,gid,volum
 /// Number of columns in [`CSV_HEADER`].
 pub const CSV_COLUMNS: usize = 19;
 
-/// The rules of a row's record, rarity measured on an NTFS and on an ext4 reference volume.
-fn rules(entry: &TimelineEntry) -> Option<Rules> {
+/// What the rules of a row's record say once the volume has had its word:
+/// the state they give, their points, and the clauses, the volume's last.
+struct Judged {
+    state: Option<State>,
+    points: u32,
+    why: String,
+}
+
+/// The rules of a row's record (rarity measured on an NTFS and on a Unix
+/// reference volume) in the context the volume gives them: a record
+/// installed with the volume is `baseline` and its time rules add nothing;
+/// the follower of a burst is `habitual` and adds nothing; the first of a
+/// burst, and a record the volume says nothing about, carry what the rules
+/// say.
+fn judged(entry: &TimelineEntry) -> Option<Judged> {
     let ntfs = matches!(entry.source, source::MFT | source::USN | source::CARVED);
-    Rules::of(&entry.flags, ntfs)
+    let (rules, state, points) = match entry.context.as_deref() {
+        Some(Context::Installed(_)) => {
+            let r = Rules::vouched(&entry.flags, ntfs)?;
+            let state = r.severity.map(rule_state).or(Some(State::Baseline));
+            (r, state, None)
+        }
+        Some(Context::Burst { leader: false, .. }) => (Rules::of(&entry.flags, ntfs)?, Some(State::Habitual), Some(0)),
+        _ => {
+            let r = Rules::of(&entry.flags, ntfs)?;
+            let state = r.severity.map(rule_state);
+            (r, state, None)
+        }
+    };
+    let points = points.unwrap_or(rules.points);
+    let why = match entry.context.as_deref() {
+        Some(c) => format!("{}; {}", rules.why, c.clause()),
+        None => rules.why,
+    };
+    Some(Judged { state, points, why })
 }
 
 /// The state a rule level gives: a high rule (`ALERT`) `significant`, a
@@ -250,11 +287,11 @@ fn rule_state(severity: Severity) -> State {
 }
 
 /// The `hunt` column: the stronger of the statistical state and the state
-/// the rules give (`significant` over `candidate` over the rest). Only
-/// masstin's six words ever go in it.
+/// the rules give in their context (`significant` over `candidate` over the
+/// rest). Only masstin's six words ever go in it.
 pub fn hunt_word(entry: &TimelineEntry) -> &'static str {
     let state = entry.mark.as_ref().map(|m| m.state);
-    let rule = rules(entry).and_then(|r| r.severity).map(rule_state);
+    let rule = judged(entry).and_then(|r| r.state);
     strongest(state, rule).map(State::as_str).unwrap_or("")
 }
 
@@ -272,19 +309,20 @@ const EMPTY_TAIL: &str = ",,,,,";
 
 fn tail(entry: &TimelineEntry) -> String {
     let mark = entry.mark.as_deref();
-    let rules = rules(entry);
-    let state = strongest(mark.map(|m| m.state), rules.as_ref().and_then(|r| r.severity).map(rule_state));
+    let rules = judged(entry);
+    let state = strongest(mark.map(|m| m.state), rules.as_ref().and_then(|r| r.state));
     if state.is_none() && rules.is_none() {
         return EMPTY_TAIL.to_string();
     }
     // a record where only noise rules fired and no test spoke: no state, no score, the clause
-    let state = state.map(State::as_str).unwrap_or("");
-    // Test and rules add, capped at masstin's top.
+    let word = state.map(State::as_str).unwrap_or("");
+    // Test and rules add, capped at masstin's top; the baseline is not scored.
     let score = match (mark.and_then(|m| m.score), &rules) {
         (s, Some(r)) => Some((u32::from(s.unwrap_or(0)) + r.points).min(u32::from(SCORE_MAX))),
         (s, None) => s.map(u32::from),
     };
-    let score = score.filter(|_| !state.is_empty()).map(|s| s.to_string()).unwrap_or_default();
+    let score = score.filter(|_| !word.is_empty() && state != Some(State::Baseline)).map(|s| s.to_string()).unwrap_or_default();
+    let state = word;
     let test = mark.map(|m| m.why.as_str()).filter(|w| !w.is_empty());
     let why = match (rules.map(|r| r.why), test) {
         (Some(r), Some(t)) => format!("{}; {}", r, t),

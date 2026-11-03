@@ -283,16 +283,21 @@ fn rarity(hits: f64, records: f64) -> u32 {
 /// | `m_after_c` | | | none | 49 |
 /// | names | none | 56 | | |
 fn points(flag: &str, ntfs: bool) -> Option<u32> {
+    hits(flag, ntfs).map(|(fired, records)| rarity(fired, records))
+}
+
+/// How many reference records a rule fired on, and how many there were.
+fn hits(flag: &str, ntfs: bool) -> Option<(f64, f64)> {
     if !ntfs {
         let fired = match flag {
             M_BEFORE_B => 71_982.0,
             FUTURE | PRE_1980 | M_AFTER_C => 0.0,
             _ => return None,
         };
-        return Some(rarity(fired, MEASURED_ON_UNIX));
+        return Some((fired, MEASURED_ON_UNIX));
     }
     if flag == USN_BASIC_INFO {
-        return Some(rarity(6_520.0, MEASURED_ON_USN));
+        return Some((6_520.0, MEASURED_ON_USN));
     }
     let fired = match flag {
         SI_BEFORE_FN => 103_104.0,
@@ -301,13 +306,62 @@ fn points(flag: &str, ntfs: bool) -> Option<u32> {
         FUTURE | PRE_1980 | RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT => 0.0,
         _ => return None,
     };
-    Some(rarity(fired, MEASURED_ON))
+    Some((fired, MEASURED_ON))
 }
+
+/// The share of clean records a rule fires on: its hits over the reference,
+/// one in `records + 1` where it never fired. None where it is not measured.
+pub fn rate(flag: &str, ntfs: bool) -> Option<f64> {
+    let (fired, records) = hits(flag, ntfs)?;
+    Some(if fired <= 0.0 { 1.0 / (records + 1.0) } else { fired / records })
+}
+
+/// Records of the NTFS reference with both `si_before_fn` and `si_subsec_zero`.
+const PAIR_HITS: f64 = 2_061.0;
 
 /// Points of `$SI` before `$FN` with whole-second `$SI` times: measured as a
 /// pair (2,061 records of 431,153), not the sum of the two. `si_before_fn`
 /// alone is noise on a modern Windows; the pair is not.
 const PAIR_POINTS: u32 = 23;
+
+fn is_pair(flags: &[&str], ntfs: bool) -> bool {
+    ntfs && flags.contains(&SI_BEFORE_FN) && flags.contains(&SI_SUBSEC_ZERO)
+}
+
+/// Whether a rule counts among the others of its record: measured at
+/// `NOISE_BELOW` points or more, not measured yet, or half of the pair.
+fn counts(flag: &str, flags: &[&str], ntfs: bool) -> bool {
+    let pair_half = is_pair(flags, ntfs) && (flag == SI_BEFORE_FN || flag == SI_SUBSEC_ZERO);
+    pair_half || points(flag, ntfs).is_none_or(|p| p >= NOISE_BELOW)
+}
+
+/// The share of clean records that carry a record's set of rules: the rate
+/// of the rarest rule that counts (the pair measured as one). None when no
+/// rule of the set counts, or none that counts is measured.
+pub fn set_rate(flags: &[&str], ntfs: bool) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    if is_pair(flags, ntfs) {
+        best = Some(PAIR_HITS / MEASURED_ON);
+    }
+    for f in flags {
+        if !counts(f, flags, ntfs) {
+            continue;
+        }
+        if let Some(r) = rate(f, ntfs) {
+            best = Some(best.map_or(r, |b| b.min(r)));
+        }
+    }
+    best
+}
+
+/// Whether an installation can vouch for a rule: the rules about times,
+/// which images and installers set by hand. Not the names, and not
+/// `backdated`: the journal saw the times move back, and no installer has a
+/// reason to do that (the convention: only a high rule whose pattern has no
+/// benign reading overrides the vouching).
+pub fn vouchable(flag: &str) -> bool {
+    !matches!(flag, RTLO_NAME | INVISIBLE_NAME | DOUBLE_EXT | BACKDATED)
+}
 
 /// What the rules of one record put in the tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,12 +391,23 @@ impl Rules {
     /// value; `ntfs` when the record is an NTFS one (the rarities are measured
     /// on NTFS only). `None` when there is no indicator.
     pub fn of(column: &str, ntfs: bool) -> Option<Rules> {
+        Self::build(column, ntfs, false)
+    }
+
+    /// The rules of a record the volume vouches for (installed with it): the
+    /// rules about its times give no level and no points, their clause only;
+    /// a rule about its name, or `backdated`, keeps both.
+    pub fn vouched(column: &str, ntfs: bool) -> Option<Rules> {
+        Self::build(column, ntfs, true)
+    }
+
+    fn build(column: &str, ntfs: bool, vouched: bool) -> Option<Rules> {
         let flags = parse_column(column);
         severity(&flags)?;
         let mut sorted: Vec<(Severity, &str)> = flags.iter().map(|f| (level(f, &flags), *f)).collect();
         sorted.sort_by_key(|s| std::cmp::Reverse(s.0));
-        let pair = ntfs && flags.contains(&SI_BEFORE_FN) && flags.contains(&SI_SUBSEC_ZERO);
-        let mut total = if pair { PAIR_POINTS } else { 0 };
+        let pair = is_pair(&flags, ntfs);
+        let mut total = if pair && !vouched { PAIR_POINTS } else { 0 };
         let mut severity: Option<Severity> = None;
         let mut why = Vec::with_capacity(sorted.len());
         for (lvl, f) in sorted {
@@ -350,8 +415,8 @@ impl Rules {
             let text = describe(f);
             let text = if text.is_empty() { f } else { text };
             let p = points(f, ntfs);
-            // measured common: no level, no points, the clause only
-            let counts = p.is_none_or(|p| p >= NOISE_BELOW) || (pair && (f == SI_BEFORE_FN || f == SI_SUBSEC_ZERO));
+            // measured common, or vouched for: no level, no points, the clause only
+            let counts = counts(f, &flags, ntfs) && !(vouched && vouchable(f));
             if counts {
                 severity = Some(severity.map_or(lvl, |s| s.max(lvl)));
             }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### The volume speaks before the rules
+
+A rule judges one record; on a clean Windows Server 2016 the rules alone made 8,169 records `significant` and 17,078 `candidate` (85,327 rows), because two things in a volume's own history make them fire by the thousand. allymacb now reads that history off the `$MFT` (or the Unix root) first (`src/context.rs`).
+
+- **The installation window is `baseline`.** The volume's birth is the creation time of its first record; the window runs from that hour through every following hour that still changed one record in a thousand of the volume (on the reference, four hours in which 98 % of the records changed, image extraction and servicing setting times by hand: 16,615 of its 16,964 `b_after_c`, 918 of its 2,061 timestomp pairs). A record changed inside the window, with no time later than its end, was installed with the volume: `baseline`, its time rules keep their clause and add nothing (the convention: a rule on an entry something vouches for adds nothing; a name rule and `backdated` still count). A `$UsnJrnl` given with the `$MFT` of the same volume takes the same window.
+- **A burst is one operation.** Outside the window, records with the same rules changed in the same hour are counted against the rules' clean rate on the records changed in that hour (Poisson, p at or below `--alpha`): when there are more than chance gives, the first record keeps the state and the points and says `burst of N records with these rules changed in <hour> (the others habitual)`; the others are `habitual` with `same burst as record <meta> (...)`. On the reference, the first boot of the machine laid down 1,139 timestomp pairs in one hour. A handful of stomped files in an ordinary hour is not a burst and each keeps its state.
+- On that clean server: 274 `significant` records and 141 `candidate`, 117,492 `baseline` by the installation, 1,472 folded into bursts. stderr prints the window and the bursts per volume and the counts. A `baseline` row carries no score.
+- `stats::poisson_tail`, the tail of a Poisson count summed in log space, is the burst test.
+
 ### Rule rarity measured on a modern Windows and a whole Linux root
 
 - **The NTFS reference is the `$MFT` of a clean Windows Server 2016 lab host** read from the live volume (431,153 records; the NIST Hacking Case `$MFT`, Windows XP, 12,183 records, was the previous one), with its `$UsnJrnl:$J` (273,208 records) for the USN rule; **the Unix reference is the whole ext4 root of a clean Ubuntu 22.04 lab host** (77,881 inodes, a bodyfile with birth times; a 256 MB image of 861 inodes before). What changed: `si_before_fn` alone fires on a quarter of a modern Windows (the install keeps the image's `$SI` times) and is noise there, 6 points, no state; the pair with `si_subsec_zero` stays the timestomp signature at 23; `b_after_c` 14; `usn_basic_info` is measured, 16; a pattern that never fired is worth 56 on NTFS, 54 on the journal and 49 on Unix (41 and 29 before); `m_after_c` is measured on Unix (never fired, 49). `backdated` and `m_before_b` on NTFS stay unmeasured.

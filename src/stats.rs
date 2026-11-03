@@ -4,6 +4,8 @@
 //!   the same statistic took on the baseline.
 //! * `benjamini_hochberg`: false-discovery-rate control across the tested
 //!   records.
+//! * `poisson_tail`: how likely a count at least this high is when events
+//!   arrive at a known rate; the burst test of [`crate::context`].
 //!
 //! No tuning constants live here. The only number the analyst chooses in the
 //! whole hunt is alpha (`--alpha`, default 0.05).
@@ -34,9 +36,63 @@ pub fn benjamini_hochberg(ps: &[f64]) -> Vec<f64> {
     q
 }
 
+/// `P(X >= k)` for `X ~ Poisson(lambda)`: 1 for `k = 0`; otherwise the
+/// terms from `k` up, summed directly when `k` lies above the rate (so a
+/// count far above it gets its tiny probability, not a rounding of 1), and
+/// the complement of the terms below `k` when it does not. All in log space,
+/// so a count in the thousands does not overflow.
+pub fn poisson_tail(k: usize, lambda: f64) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    if lambda <= 0.0 {
+        return 0.0;
+    }
+    // ln of the terms i = 0 .. k, and their sum below k
+    let mut below = 0.0f64;
+    let mut log_term = -lambda;
+    for i in 0..k {
+        if i > 0 {
+            log_term += lambda.ln() - (i as f64).ln();
+        }
+        below += log_term.exp();
+    }
+    if (k as f64) <= lambda {
+        return (1.0 - below).clamp(0.0, 1.0);
+    }
+    log_term += lambda.ln() - (k as f64).ln(); // the term at k
+    let mut tail = 0.0f64;
+    let mut i = k;
+    loop {
+        let term = log_term.exp();
+        tail += term;
+        if term == 0.0 || term < tail * 1e-17 {
+            break;
+        }
+        i += 1;
+        log_term += lambda.ln() - (i as f64).ln();
+    }
+    tail.clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisson() {
+        assert_eq!(poisson_tail(0, 3.0), 1.0);
+        assert_eq!(poisson_tail(2, 0.0), 0.0);
+        // P(X >= 1 | 1) = 1 - e^-1
+        assert!((poisson_tail(1, 1.0) - (1.0 - (-1.0f64).exp())).abs() < 1e-12);
+        // P(X >= 3 | 2) = 1 - e^-2 (1 + 2 + 2) = 0.3233
+        assert!((poisson_tail(3, 2.0) - 0.323_323_6).abs() < 1e-6);
+        // a count far above the rate is next to impossible, and far below it certain
+        assert!(poisson_tail(300, 20.0) < 1e-100);
+        assert!(poisson_tail(5, 2000.0) > 1.0 - 1e-12);
+        // two among fifty at one in twenty-five: what the rate gives
+        assert!(poisson_tail(2, 2.0) > 0.5);
+    }
 
     #[test]
     fn bh_known() {
