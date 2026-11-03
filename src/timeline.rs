@@ -251,9 +251,9 @@ struct Judged {
 /// The rules of a row's record (rarity measured on an NTFS and on a Unix
 /// reference volume) in the context the volume gives them: a record
 /// installed with the volume is `baseline` and its time rules add nothing;
-/// the follower of a burst is `habitual` and adds nothing; the first of a
-/// burst, and a record the volume says nothing about, carry what the rules
-/// say.
+/// a record whose hour explains its rules, or the follower of a burst, is
+/// `habitual` and adds nothing; the first of a burst, and a record the
+/// volume says nothing about, carry what the rules say.
 fn judged(entry: &TimelineEntry) -> Option<Judged> {
     let ntfs = matches!(entry.source, source::MFT | source::USN | source::CARVED);
     let (rules, state, points) = match entry.context.as_deref() {
@@ -262,7 +262,7 @@ fn judged(entry: &TimelineEntry) -> Option<Judged> {
             let state = r.severity.map(rule_state).or(Some(State::Baseline));
             (r, state, None)
         }
-        Some(Context::Burst { leader: false, .. }) => (Rules::of(&entry.flags, ntfs)?, Some(State::Habitual), Some(0)),
+        Some(Context::Burst { leader: false, .. }) | Some(Context::Chance(_)) => (Rules::of(&entry.flags, ntfs)?, Some(State::Habitual), Some(0)),
         _ => {
             let r = Rules::of(&entry.flags, ntfs)?;
             let state = r.severity.map(rule_state);
@@ -284,6 +284,12 @@ fn rule_state(severity: Severity) -> State {
         Severity::Alert => State::Significant,
         Severity::Warn => State::Candidate,
     }
+}
+
+/// The state the rules give a row in their context, on its own: what the
+/// statistical hunt did not say. Empty when no rule counts.
+pub fn rule_word(entry: &TimelineEntry) -> &'static str {
+    judged(entry).and_then(|r| r.state).map(State::as_str).unwrap_or("")
 }
 
 /// The `hunt` column: the stronger of the statistical state and the state

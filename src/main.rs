@@ -46,6 +46,7 @@ fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContex
     let mut warn_files: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
     let mut installed: BTreeSet<(String, String)> = BTreeSet::new();
     let mut folded: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut chance: BTreeSet<(String, String)> = BTreeSet::new();
     for e in timeline {
         if e.flags.is_empty() {
             continue;
@@ -56,12 +57,15 @@ fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContex
             None => base_name(&e.file_name),
         };
         let key = (e.meta.clone(), name);
-        match (e.context.as_deref(), timeline::hunt_word(e)) {
+        match (e.context.as_deref(), timeline::rule_word(e)) {
             (Some(context::Context::Installed(_)), "baseline") => {
                 installed.insert(key);
             }
             (Some(context::Context::Burst { leader: false, .. }), "habitual") => {
                 folded.insert(key);
+            }
+            (Some(context::Context::Chance(_)), "habitual") => {
+                chance.insert(key);
             }
             (_, "significant") => {
                 alerts.entry(key).or_default().extend(flags);
@@ -111,6 +115,9 @@ fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContex
     }
     if !folded.is_empty() {
         eprintln!("[*] {} file(s) folded into a burst: `habitual`, `same burst as record` in hunt_why points at the first", folded.len());
+    }
+    if !chance.is_empty() {
+        eprintln!("[*] {} file(s) whose rules are what the clean rate gives for the records changed in their hour: `habitual`", chance.len());
     }
 }
 

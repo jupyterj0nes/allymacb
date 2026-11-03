@@ -17,16 +17,22 @@
 //!   the birth hour through every following hour that still changed at least
 //!   one record in a thousand of the volume.
 //!
-//! * **Bursts.** Outside the installation, a rule that fires on hundreds of
-//!   records changed in the same hour met one operation (the first boot of a
+//! * **The hour.** Outside the installation, every record with rules that
+//!   count is judged with the others of its hour: how many records changed
+//!   in that hour on the volume, how many of them carry the same rules, and
+//!   how many the rules' clean rate would give (their rate on a clean
+//!   volume times the records changed). When the hour holds no more than
+//!   the rate gives (Poisson, p above alpha), the hits are what a clean
+//!   machine produces in an hour like that: `habitual`, no points, the
+//!   clause says the numbers. When it holds more, something happened in
+//!   that hour that chance does not explain: the first record keeps the
+//!   state and the points and says how many came with it, and the others
+//!   are `habitual` and point at the first, because hundreds of records
+//!   with the same rules in one hour are one operation (the first boot of a
 //!   virtual machine, an update, a copy with preserved times), not hundreds
-//!   of anomalies. When an hour holds more records with the same rules than
-//!   the rules' clean rate predicts for the records changed in that hour
-//!   (Poisson, p at or below alpha), the group is one burst: its first record
-//!   keeps the state and the points and says how many came with it; the
-//!   others are `habitual`, with the clause and a pointer to the first. A
-//!   handful of stomped files in an ordinary hour is not a burst: the clean
-//!   rate predicts a few, and each keeps its state.
+//!   of anomalies. A single file with a never-seen pattern in a quiet hour
+//!   is more than the rate gives and keeps its state; a single `b_after_c`
+//!   in an hour that changed a thousand files is not, and does not.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,19 +74,48 @@ impl Install {
 pub enum Context {
     /// Changed inside the installation window, nothing later: `baseline`.
     Installed(Arc<Install>),
-    /// One of a group of records with the same rules changed in the same
-    /// hour, more than chance gives.
+    /// One of the records with the same rules changed in the same hour,
+    /// more of them than the clean rate gives.
     Burst {
         /// The first record of the burst keeps its state; the others are
         /// `habitual`.
         leader: bool,
         /// `meta` of the first record.
         leader_meta: Arc<str>,
-        /// Records in the burst.
-        records: usize,
-        /// The hour, `2026-11-03T10`.
-        hour: Arc<str>,
+        /// What the hour held.
+        hour: Arc<Hour>,
     },
+    /// One of the records with the same rules changed in the same hour, no
+    /// more of them than the clean rate gives: `habitual`.
+    Chance(Arc<Hour>),
+}
+
+/// The records of one hour of one volume that carry one set of rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hour {
+    /// `2026-11-03T10`.
+    pub label: String,
+    /// Records of the volume changed in the hour.
+    pub changed: usize,
+    /// Of them, records with these rules.
+    pub records: usize,
+    /// What the rules' clean rate gives on `changed` records.
+    pub expected: f64,
+}
+
+// `expected` is a count, never NaN.
+impl Eq for Hour {}
+
+impl Hour {
+    fn expected(&self) -> String {
+        if self.expected < 0.01 {
+            "under 0.01".to_string()
+        } else if self.expected < 10.0 {
+            format!("{:.2}", self.expected)
+        } else {
+            format!("{:.0}", self.expected)
+        }
+    }
 }
 
 impl Context {
@@ -88,12 +123,22 @@ impl Context {
     pub fn clause(&self) -> String {
         match self {
             Context::Installed(w) => w.clause(),
-            Context::Burst { leader: true, records, hour, .. } => {
-                format!("burst of {} records with these rules changed in {} (the others habitual)", records, hour)
-            }
-            Context::Burst { leader: false, leader_meta, records, hour } => {
-                format!("same burst as record {} ({} records with these rules changed in {})", leader_meta, records, hour)
-            }
+            Context::Burst { leader: true, hour, .. } if hour.records == 1 => format!(
+                "the only record with these rules among the {} changed in {}; the clean rate gives {}",
+                hour.changed, hour.label, hour.expected()
+            ),
+            Context::Burst { leader: true, hour, .. } => format!(
+                "burst: {} of the {} records changed in {} carry these rules; the clean rate gives {} (the others habitual)",
+                hour.records, hour.changed, hour.label, hour.expected()
+            ),
+            Context::Burst { leader: false, leader_meta, hour } => format!(
+                "same burst as record {} ({} of the {} records changed in {} carry these rules)",
+                leader_meta, hour.records, hour.changed, hour.label
+            ),
+            Context::Chance(hour) => format!(
+                "{} of the {} records changed in {} carry these rules; the clean rate gives {}: what a clean machine does",
+                hour.records, hour.changed, hour.label, hour.expected()
+            ),
         }
     }
 }
@@ -109,6 +154,8 @@ pub struct VolumeContext {
     pub bursts: usize,
     /// Records folded into a burst as followers.
     pub folded: usize,
+    /// Records whose rules the clean rate explains in their hour.
+    pub chance: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +301,7 @@ pub fn attach(timeline: &mut [TimelineEntry], alpha: f64) -> Vec<VolumeContext> 
             install = Some(w);
         }
 
-        // ── bursts ──
+        // ── the hour ──
         let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
         for &k in &members {
             let r = &recs[k];
@@ -270,29 +317,33 @@ pub fn attach(timeline: &mut [TimelineEntry], alpha: f64) -> Vec<VolumeContext> 
         }
         let mut bursts = 0;
         let mut folded = 0;
+        let mut chance = 0;
         for ((flags, hour), mut group) in groups {
-            if group.len() < 2 {
-                continue;
-            }
             let rate = anomaly::set_rate(&anomaly::parse_column(&flags), kind != Kind::Unix).unwrap_or(1.0);
-            let changed = per_hour.get(&hour).copied().unwrap_or(group.len());
+            let changed = per_hour.get(&hour).copied().unwrap_or(group.len()).max(group.len());
             let expected = rate * changed as f64;
+            let what = Arc::new(Hour { label: hour_label(hour), changed, records: group.len(), expected });
             if poisson_tail(group.len(), expected) > alpha {
+                let ctx = Arc::new(Context::Chance(what));
+                for &k in &group {
+                    contexts[k] = Some(ctx.clone());
+                }
+                chance += group.len();
                 continue;
             }
             group.sort_by_key(|&k| (recs[k].change, k));
             let leader: Arc<str> = Arc::from(recs[group[0]].meta.as_str());
-            let label: Arc<str> = Arc::from(hour_label(hour).as_str());
-            let head = Arc::new(Context::Burst { leader: true, leader_meta: leader.clone(), records: group.len(), hour: label.clone() });
-            let rest = Arc::new(Context::Burst { leader: false, leader_meta: leader, records: group.len(), hour: label });
-            contexts[group[0]] = Some(head);
-            for &k in &group[1..] {
-                contexts[k] = Some(rest.clone());
+            contexts[group[0]] = Some(Arc::new(Context::Burst { leader: true, leader_meta: leader.clone(), hour: what.clone() }));
+            if group.len() > 1 {
+                let rest = Arc::new(Context::Burst { leader: false, leader_meta: leader, hour: what });
+                for &k in &group[1..] {
+                    contexts[k] = Some(rest.clone());
+                }
+                bursts += 1;
+                folded += group.len() - 1;
             }
-            bursts += 1;
-            folded += group.len() - 1;
         }
-        summaries.push(VolumeContext { place, records: total, install: install.map(|w| (*w).clone()), bursts, folded });
+        summaries.push(VolumeContext { place, records: total, install: install.map(|w| (*w).clone()), bursts, folded, chance });
     }
     for (k, ctx) in contexts.into_iter().enumerate() {
         if let Some(ctx) = ctx {
@@ -328,7 +379,7 @@ mod tests {
     const BIRTH: i64 = 1_792_985_767; // 2026-10-26T03:36:07Z
 
     /// A volume born at BIRTH: 2,000 records in the birth hour and the next
-    /// (399 of them `b_after_c`), 3 two hours after that, then life.
+    /// (399 of them `b_after_c`), 3 two hours after that (none flagged), then life.
     fn volume() -> Vec<TimelineEntry> {
         let mut t = vec![ntfs(7, 0, BIRTH, BIRTH, "C:\\$MFT")];
         for i in 1..2000u64 {
@@ -363,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_after_the_installation_folds_to_its_first_record() {
+    fn the_hour_judges_both_ways() {
         let mut t = volume();
         // the first boot, a week later: 300 records changed, 120 with b_after_c
         let boot = BIRTH + 8 * 86_400;
@@ -372,28 +423,34 @@ mod tests {
             let b = if i < 120 { c + 30 } else { c - 1 };
             t.push(ntfs(7, 9000 + i, c, b, &format!("C:\\boot{}", i)));
         }
-        // and two stomped files in an ordinary hour: the clean rate of
-        // b_after_c (one in 25) predicts a few among the 50 changed, so no burst
+        // two b_after_c among fifty changed in an ordinary hour: the clean
+        // rate (one in 25) gives two, so they are what a clean machine does
         let later = boot + 3 * 86_400;
         for i in 0..50u64 {
             let c = later + (i as i64) * 11;
             let b = if i < 2 { c + 99 } else { c - 1 };
             t.push(ntfs(7, 12_000 + i, c, b, &format!("C:\\Users\\bob\\d{}", i)));
         }
+        // one b_after_c in a quiet hour where only it changed: more than the rate gives
+        let quiet = later + 86_400;
+        t.push(ntfs(7, 13_000, quiet, quiet + 99, "C:\\Users\\bob\\lone.txt"));
         let s = attach(&mut t, 0.05);
-        assert_eq!((s[0].bursts, s[0].folded), (1, 119));
+        assert_eq!((s[0].bursts, s[0].folded, s[0].chance), (1, 119, 2));
         let leader = t.iter().find(|e| e.meta == "9000").unwrap();
-        assert!(matches!(leader.context.as_deref(), Some(Context::Burst { leader: true, records: 120, .. })), "{:?}", leader.context);
         let row = format_csv_row(leader);
-        assert!(row.ends_with(",candidate,14,rule b_after_c (medium): $SI creation after the record change time; burst of 120 records with these rules changed in 2026-11-03T03 (the others habitual),,"), "{}", row);
+        assert!(row.ends_with(",candidate,14,rule b_after_c (medium): $SI creation after the record change time; burst: 120 of the 205 records changed in 2026-11-03T03 carry these rules; the clean rate gives 8.07 (the others habitual),,"), "{}", row);
         let member = t.iter().find(|e| e.meta == "9119").unwrap();
         let row = format_csv_row(member);
-        assert!(row.ends_with(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; same burst as record 9000 (120 records with these rules changed in 2026-11-03T03),,"), "{}", row);
+        assert!(row.ends_with(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; same burst as record 9000 (120 of the 205 records changed in 2026-11-03T03 carry these rules),,"), "{}", row);
         for m in ["12000", "12001"] {
             let e = t.iter().find(|e| e.meta == m).unwrap();
-            assert!(e.context.is_none(), "two among fifty is what the clean rate gives: {:?}", e.context);
-            assert!(format_csv_row(e).contains(",candidate,14,rule b_after_c"));
+            assert!(matches!(e.context.as_deref(), Some(Context::Chance(_))), "{:?}", e.context);
+            let row = format_csv_row(e);
+            assert!(row.ends_with(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; 2 of the 50 records changed in 2026-11-06T03 carry these rules; the clean rate gives 1.97: what a clean machine does,,"), "{}", row);
         }
+        let lone = t.iter().find(|e| e.meta == "13000").unwrap();
+        let row = format_csv_row(lone);
+        assert!(row.ends_with(",candidate,14,rule b_after_c (medium): $SI creation after the record change time; the only record with these rules among the 1 changed in 2026-11-07T03; the clean rate gives 0.04,,"), "{}", row);
     }
 
     #[test]
@@ -418,7 +475,7 @@ mod tests {
         assert!(matches!(inside.context.as_deref(), Some(Context::Installed(_))));
         assert!(format_csv_row(inside).contains(",baseline,,rule usn_basic_info (high)"), "{}", format_csv_row(inside));
         let later = t.iter().find(|e| e.source == source::USN && e.meta == "52").unwrap();
-        assert!(later.context.is_none());
+        assert!(matches!(later.context.as_deref(), Some(Context::Burst { leader: true, .. })), "alone in its hour: more than one in 42 gives: {:?}", later.context);
         assert!(format_csv_row(later).contains(",significant,16,rule usn_basic_info (high)"), "{}", format_csv_row(later));
     }
 
@@ -430,6 +487,7 @@ mod tests {
         assert!(s[0].install.is_none());
         // without a window the installation itself is one burst
         assert_eq!(s[0].bursts, 2, "the 399 b_after_c records fall in two hours");
+        assert_eq!(s[0].chance, 0);
     }
 
     #[test]
