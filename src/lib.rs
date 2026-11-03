@@ -1,6 +1,7 @@
 pub mod anomaly;
 pub mod cli;
 pub mod context;
+pub mod hours;
 pub mod error;
 pub mod hunt;
 pub mod ingest;

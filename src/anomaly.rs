@@ -138,7 +138,9 @@ pub fn name_flags(name: &str) -> Vec<&'static str> {
         // a shortcut to Readme.txt.
         const EXEC: [&str; 11] = ["exe", "scr", "com", "bat", "cmd", "ps1", "js", "jse", "vbs", "vbe", "hta"];
         const DOC: [&str; 14] = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "jpg", "jpeg", "png", "gif", "zip", "rtf"];
-        if EXEC.contains(&last) && DOC.contains(&prev) {
+        // PowerShell's own policy probe, `__PSScriptPolicyTest_<8 random>.<3 random>.ps1`,
+        // lands on a document extension one time in a few hundred.
+        if EXEC.contains(&last) && DOC.contains(&prev) && !base.starts_with("__psscriptpolicytest_") {
             push(&mut flags, DOUBLE_EXT);
         }
     }
@@ -354,6 +356,29 @@ pub fn set_rate(flags: &[&str], ntfs: bool) -> Option<f64> {
     best
 }
 
+/// The timestomp signature as one pattern, the way it is scored and the way
+/// the clean hours are measured (`scripts/measure_hours.py`).
+pub const PAIR: &str = "si_before_fn+si_subsec_zero";
+
+/// The patterns of a record the hour test looks up: its rules that count,
+/// `si_before_fn` with `si_subsec_zero` as the one pattern [`PAIR`].
+pub fn patterns(flags: &[&str], ntfs: bool) -> Vec<String> {
+    let pair = is_pair(flags, ntfs);
+    let mut out: Vec<String> = Vec::new();
+    if pair {
+        out.push(PAIR.to_string());
+    }
+    for f in flags {
+        if pair && (*f == SI_BEFORE_FN || *f == SI_SUBSEC_ZERO) {
+            continue;
+        }
+        if counts(f, flags, ntfs) {
+            out.push((*f).to_string());
+        }
+    }
+    out
+}
+
 /// Whether an installation can vouch for a rule: the rules about times,
 /// which images and installers set by hand. Not the names, and not
 /// `backdated`: the journal saw the times move back, and no installer has a
@@ -462,6 +487,7 @@ mod tests {
         assert_eq!(name_flags("report\u{202E}fdp.exe"), vec![RTLO_NAME]);
         assert_eq!(name_flags("pass\u{200B}word.txt"), vec![INVISIBLE_NAME]);
         assert!(name_flags("archive.tar.gz").is_empty());
+        assert!(name_flags("C:/Windows/Temp/__PSScriptPolicyTest_rh2yr4jl.ppt.ps1").is_empty(), "PowerShell's policy probe");
         assert!(name_flags("setup.exe").is_empty());
         assert!(name_flags("\u{5831}\u{544A}\u{66F8} 2026.txt").is_empty(), "CJK is not suspicious");
     }

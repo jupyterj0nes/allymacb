@@ -18,28 +18,35 @@
 //!   one record in a thousand of the volume.
 //!
 //! * **The hour.** Outside the installation, every record with rules that
-//!   count is judged with the others of its hour: how many records changed
-//!   in that hour on the volume, how many of them carry the same rules, and
-//!   how many the rules' clean rate would give (their rate on a clean
-//!   volume times the records changed). When the hour holds no more than
-//!   the rate gives (Poisson, p above alpha), the hits are what a clean
-//!   machine produces in an hour like that: `habitual`, no points, the
-//!   clause says the numbers. When it holds more, something happened in
-//!   that hour that chance does not explain: the first record keeps the
-//!   state and the points and says how many came with it, and the others
-//!   are `habitual` and point at the first, because hundreds of records
-//!   with the same rules in one hour are one operation (the first boot of a
-//!   virtual machine, an update, a copy with preserved times), not hundreds
-//!   of anomalies. A single file with a never-seen pattern in a quiet hour
-//!   is more than the rate gives and keeps its state; a single `b_after_c`
-//!   in an hour that changed a thousand files is not, and does not.
+//!   count is judged with the others of its hour, against the hours of clean
+//!   machines (`src/hours.rs`, measured by `scripts/measure_hours.py`): of
+//!   the records that changed in the hour on the volume, what share carry
+//!   the same pattern, and how many clean hours reach that share. The p is
+//!   empirical, with the add-one correction, as in masstin's graph-hunt:
+//!   `(1 + clean hours at or above the share) / (1 + clean hours)`. At or
+//!   below alpha, the hour holds something clean machines do not: the first
+//!   record keeps the state and the points and says how many came with it,
+//!   and the others are `habitual` and point at it, because hundreds of
+//!   records with the same pattern in one hour are one operation, not
+//!   hundreds of anomalies (a pattern no clean hour has at all is not
+//!   folded: nothing benign does that by the hundred, so every record keeps
+//!   its state). Above alpha, the hour is one a clean machine
+//!   has: `habitual`, no points, the clause gives the numbers. The first
+//!   boot of a virtual machine (1,139 files with preserved times in one
+//!   hour on the reference) and the hourly touch of `UsrClass.dat` are
+//!   clean hours, and a case's hour that looks like them is judged like
+//!   them. A pattern no clean hour has at all is never explained by its
+//!   hour: the record keeps its state, and the corpus bound is its score.
+//!   What this can say is bounded by the clean hours measured: with
+//!   fourteen, no share is rarer than one in fifteen, and only the patterns
+//!   clean machines never produce reach a state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::anomaly;
+use crate::hours::{self, CleanHour};
 use crate::hunt::{Evidence, Macb, Ts};
-use crate::stats::poisson_tail;
 use crate::timefmt::format_unix_timestamp;
 use crate::timeline::TimelineEntry;
 
@@ -75,7 +82,7 @@ pub enum Context {
     /// Changed inside the installation window, nothing later: `baseline`.
     Installed(Arc<Install>),
     /// One of the records with the same rules changed in the same hour,
-    /// more of them than the clean rate gives.
+    /// a share of the hour's records that clean hours do not reach.
     Burst {
         /// The first record of the burst keeps its state; the others are
         /// `habitual`.
@@ -85,35 +92,42 @@ pub enum Context {
         /// What the hour held.
         hour: Arc<Hour>,
     },
-    /// One of the records with the same rules changed in the same hour, no
-    /// more of them than the clean rate gives: `habitual`.
+    /// One of the records with the same rules changed in the same hour, a
+    /// share of the hour's records that clean hours reach: `habitual`.
     Chance(Arc<Hour>),
 }
 
-/// The records of one hour of one volume that carry one set of rules.
-#[derive(Debug, Clone, PartialEq)]
+/// The records of one hour of one volume that carry one set of rules,
+/// against the clean hours.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hour {
     /// `2026-11-03T10`.
     pub label: String,
     /// Records of the volume changed in the hour.
     pub changed: usize,
-    /// Of them, records with these rules.
+    /// Of them, records with this set of rules.
     pub records: usize,
-    /// What the rules' clean rate gives on `changed` records.
-    pub expected: f64,
+    /// The pattern that decided: the rarest among the set's, in clean hours.
+    pub pattern: String,
+    /// Records of the hour with that pattern.
+    pub hits: usize,
+    /// Clean hours whose share of that pattern reaches `hits / changed`.
+    pub seen: usize,
+    /// Clean hours measured for this kind of record.
+    pub of: usize,
+    /// No clean hour has the pattern at all.
+    pub never: bool,
 }
 
-// `expected` is a count, never NaN.
-impl Eq for Hour {}
-
 impl Hour {
-    fn expected(&self) -> String {
-        if self.expected < 0.01 {
-            "under 0.01".to_string()
-        } else if self.expected < 10.0 {
-            format!("{:.2}", self.expected)
+    fn share(&self) -> String {
+        if self.never {
+            format!("{} of the {} records changed in {} carry {} and no clean hour has that pattern", self.hits, self.changed, self.label, self.pattern)
         } else {
-            format!("{:.0}", self.expected)
+            format!(
+                "{} of the {} records changed in {} carry {} and {} of {} clean hours reach that share",
+                self.hits, self.changed, self.label, self.pattern, self.seen, self.of
+            )
         }
     }
 }
@@ -123,22 +137,10 @@ impl Context {
     pub fn clause(&self) -> String {
         match self {
             Context::Installed(w) => w.clause(),
-            Context::Burst { leader: true, hour, .. } if hour.records == 1 => format!(
-                "the only record with these rules among the {} changed in {}; the clean rate gives {}",
-                hour.changed, hour.label, hour.expected()
-            ),
-            Context::Burst { leader: true, hour, .. } => format!(
-                "burst: {} of the {} records changed in {} carry these rules; the clean rate gives {} (the others habitual)",
-                hour.records, hour.changed, hour.label, hour.expected()
-            ),
-            Context::Burst { leader: false, leader_meta, hour } => format!(
-                "same burst as record {} ({} of the {} records changed in {} carry these rules)",
-                leader_meta, hour.records, hour.changed, hour.label
-            ),
-            Context::Chance(hour) => format!(
-                "{} of the {} records changed in {} carry these rules; the clean rate gives {}: what a clean machine does",
-                hour.records, hour.changed, hour.label, hour.expected()
-            ),
+            Context::Burst { leader: true, hour, .. } if hour.records == 1 || hour.never => hour.share(),
+            Context::Burst { leader: true, hour, .. } => format!("burst: {} (the other {} habitual)", hour.share(), hour.records - 1),
+            Context::Burst { leader: false, leader_meta, hour } => format!("same burst as record {} ({} records with these rules changed in {})", leader_meta, hour.records, hour.label),
+            Context::Chance(hour) => format!("{} (what a clean machine does)", hour.share()),
         }
     }
 }
@@ -302,45 +304,79 @@ pub fn attach(timeline: &mut [TimelineEntry], alpha: f64) -> Vec<VolumeContext> 
         }
 
         // ── the hour ──
+        let clean: &[CleanHour] = match kind {
+            Kind::Ntfs => hours::NTFS,
+            Kind::Usn => hours::USN,
+            Kind::Unix => hours::UNIX,
+        };
         let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+        let mut per_pattern: HashMap<(String, i64), usize> = HashMap::new();
         for &k in &members {
             let r = &recs[k];
             if installed[k] || r.flags.is_empty() {
                 continue;
             }
             let Some(c) = r.change else { continue };
-            let flags = anomaly::parse_column(&r.flags);
-            if anomaly::set_rate(&flags, r.kind != Kind::Unix).is_none() {
+            let patterns = anomaly::patterns(&anomaly::parse_column(&r.flags), r.kind != Kind::Unix);
+            if patterns.is_empty() {
                 continue;
             }
-            groups.entry((r.flags.clone(), hour_of(c))).or_default().push(k);
+            for p in &patterns {
+                *per_pattern.entry((p.clone(), hour_of(c))).or_default() += 1;
+            }
+            groups.entry((patterns.join("+"), hour_of(c))).or_default().push(k);
         }
         let mut bursts = 0;
         let mut folded = 0;
         let mut chance = 0;
-        for ((flags, hour), mut group) in groups {
-            let rate = anomaly::set_rate(&anomaly::parse_column(&flags), kind != Kind::Unix).unwrap_or(1.0);
-            let changed = per_hour.get(&hour).copied().unwrap_or(group.len()).max(group.len());
-            let expected = rate * changed as f64;
-            let what = Arc::new(Hour { label: hour_label(hour), changed, records: group.len(), expected });
-            if poisson_tail(group.len(), expected) > alpha {
-                let ctx = Arc::new(Context::Chance(what));
-                for &k in &group {
-                    contexts[k] = Some(ctx.clone());
+        if !clean.is_empty() {
+            for ((key, hour), mut group) in groups {
+                let changed = per_hour.get(&hour).copied().unwrap_or(group.len()).max(group.len());
+                // the rarest of the set's patterns in clean hours decides
+                let mut best: Option<Hour> = None;
+                for pattern in anomaly::patterns(&anomaly::parse_column(&recs[group[0]].flags), kind != Kind::Unix) {
+                    let hits = per_pattern.get(&(pattern.clone(), hour)).copied().unwrap_or(0);
+                    let share = hits as f64 / changed as f64;
+                    let clean_hits = |h: &CleanHour| h.hits.iter().find(|(r, _)| *r == pattern).map_or(0, |(_, n)| *n);
+                    let never = clean.iter().all(|h| clean_hits(h) == 0);
+                    let seen = clean.iter().filter(|h| clean_hits(h) as f64 / h.changed as f64 >= share).count();
+                    let this = Hour { label: hour_label(hour), changed, records: group.len(), pattern, hits, seen, of: clean.len(), never };
+                    let rarer = |h: &Hour| if h.never { -1 } else { h.seen as i64 };
+                    if best.as_ref().is_none_or(|b| rarer(&this) < rarer(b)) {
+                        best = Some(this);
+                    }
                 }
-                chance += group.len();
-                continue;
-            }
-            group.sort_by_key(|&k| (recs[k].change, k));
-            let leader: Arc<str> = Arc::from(recs[group[0]].meta.as_str());
-            contexts[group[0]] = Some(Arc::new(Context::Burst { leader: true, leader_meta: leader.clone(), hour: what.clone() }));
-            if group.len() > 1 {
-                let rest = Arc::new(Context::Burst { leader: false, leader_meta: leader, hour: what });
-                for &k in &group[1..] {
-                    contexts[k] = Some(rest.clone());
+                let Some(what) = best else { continue };
+                let p = if what.never { 0.0 } else { (1.0 + what.seen as f64) / (1.0 + what.of as f64) };
+                let what = Arc::new(what);
+                let _ = key;
+                if p > alpha {
+                    let ctx = Arc::new(Context::Chance(what));
+                    for &k in &group {
+                        contexts[k] = Some(ctx.clone());
+                    }
+                    chance += group.len();
+                    continue;
                 }
-                bursts += 1;
-                folded += group.len() - 1;
+                group.sort_by_key(|&k| (recs[k].change, k));
+                let leader: Arc<str> = Arc::from(recs[group[0]].meta.as_str());
+                contexts[group[0]] = Some(Arc::new(Context::Burst { leader: true, leader_meta: leader.clone(), hour: what.clone() }));
+                if what.never {
+                    // a pattern clean machines never produce has no benign mass
+                    // operation behind it: every record keeps its state
+                    for &k in &group[1..] {
+                        contexts[k] = Some(Arc::new(Context::Burst { leader: true, leader_meta: leader.clone(), hour: what.clone() }));
+                    }
+                    continue;
+                }
+                if group.len() > 1 {
+                    let rest = Arc::new(Context::Burst { leader: false, leader_meta: leader, hour: what });
+                    for &k in &group[1..] {
+                        contexts[k] = Some(rest.clone());
+                    }
+                    bursts += 1;
+                    folded += group.len() - 1;
+                }
             }
         }
         summaries.push(VolumeContext { place, records: total, install: install.map(|w| (*w).clone()), bursts, folded, chance });
@@ -413,44 +449,64 @@ mod tests {
         assert_eq!(s[0].bursts, 0);
     }
 
+    /// One NTFS record with its times in the future: a pattern no clean hour has.
+    fn future(volume: u32, entry: u64, c: i64, name: &str) -> TimelineEntry {
+        let far = c + 10 * 365 * 86_400;
+        let si = Macb { m: ts(far), a: ts(c), c: ts(c), b: ts(far) };
+        TimelineEntry::new(stamp(c), c, 0, 1, "m..b".into(), "-/-rwxrwxrwx".into(), 0, 0, entry.to_string(), name.into())
+            .with_source(source::MFT)
+            .with_flags("ALERT: future".into())
+            .with_hunt(Some(hunt::record(volume, Evidence::Ntfs { entry, seq: 1, si, fns: vec![] })))
+    }
+
     #[test]
-    fn the_hour_judges_both_ways() {
+    fn the_hour_is_judged_against_clean_hours() {
+        let n = hours::NTFS.len();
+        assert!(n > 0, "the NTFS clean hours are measured");
         let mut t = volume();
-        // the first boot, a week later: 300 records changed, 120 with b_after_c
+        // the first boot, a week later: 300 records changed, 120 with
+        // b_after_c. A share clean hours reach? The reference's own first
+        // boot had one in ten; this is more, and fourteen clean hours cannot
+        // vouch for one in twenty: habitual either way, the clause says which.
         let boot = BIRTH + 8 * 86_400;
         for i in 0..300u64 {
             let c = boot + (i as i64) * 7;
             let b = if i < 120 { c + 30 } else { c - 1 };
             t.push(ntfs(7, 9000 + i, c, b, &format!("C:\\boot{}", i)));
         }
-        // two b_after_c among fifty changed in an ordinary hour: the clean
-        // rate (one in 25) gives two, so they are what a clean machine does
+        // two files with future times in an ordinary hour: no clean hour has that pattern
         let later = boot + 3 * 86_400;
         for i in 0..50u64 {
             let c = later + (i as i64) * 11;
-            let b = if i < 2 { c + 99 } else { c - 1 };
-            t.push(ntfs(7, 12_000 + i, c, b, &format!("C:\\Users\\bob\\d{}", i)));
+            if i < 2 {
+                t.push(future(7, 12_000 + i, c, &format!("C:\\Users\\bob\\f{}", i)));
+            } else {
+                t.push(ntfs(7, 12_000 + i, c, c - 1, &format!("C:\\Users\\bob\\d{}", i)));
+            }
         }
-        // one b_after_c in a quiet hour where only it changed: more than the rate gives
-        let quiet = later + 86_400;
-        t.push(ntfs(7, 13_000, quiet, quiet + 99, "C:\\Users\\bob\\lone.txt"));
         let s = attach(&mut t, 0.05);
-        assert_eq!((s[0].bursts, s[0].folded, s[0].chance), (1, 119, 2));
-        let leader = t.iter().find(|e| e.meta == "9000").unwrap();
-        let row = format_csv_row(leader);
-        assert!(row.ends_with(",candidate,14,rule b_after_c (medium): $SI creation after the record change time; burst: 120 of the 205 records changed in 2026-11-03T03 carry these rules; the clean rate gives 8.07 (the others habitual),,"), "{}", row);
-        let member = t.iter().find(|e| e.meta == "9119").unwrap();
-        let row = format_csv_row(member);
-        assert!(row.ends_with(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; same burst as record 9000 (120 of the 205 records changed in 2026-11-03T03 carry these rules),,"), "{}", row);
-        for m in ["12000", "12001"] {
-            let e = t.iter().find(|e| e.meta == m).unwrap();
-            assert!(matches!(e.context.as_deref(), Some(Context::Chance(_))), "{:?}", e.context);
-            let row = format_csv_row(e);
-            assert!(row.ends_with(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; 2 of the 50 records changed in 2026-11-06T03 carry these rules; the clean rate gives 1.97: what a clean machine does,,"), "{}", row);
-        }
+        assert_eq!((s[0].bursts, s[0].folded, s[0].chance), (0, 0, 120), "{:?}", s[0]);
+        let boot0 = t.iter().find(|e| e.meta == "9000").unwrap();
+        let row = format_csv_row(boot0);
+        assert!(matches!(boot0.context.as_deref(), Some(Context::Chance(_))), "{:?}", boot0.context);
+        assert!(row.ends_with(&format!(",habitual,0,rule b_after_c (medium): $SI creation after the record change time; 120 of the 205 records changed in 2026-11-03T03 carry b_after_c and 0 of {n} clean hours reach that share (what a clean machine does),,")), "{}", row);
+        let lead = t.iter().find(|e| e.meta == "12000").unwrap();
+        let row = format_csv_row(lead);
+        assert!(row.ends_with(",significant,56,rule future (high): a timestamp more than a day after the timeline was built; 2 of the 50 records changed in 2026-11-06T03 carry future and no clean hour has that pattern,,"), "{}", row);
+        // a pattern no clean machine produces is not folded: both keep their state
+        let second = t.iter().find(|e| e.meta == "12001").unwrap();
+        assert_eq!(format_csv_row(second).split(',').nth(14), Some("significant"), "{}", format_csv_row(second));
+    }
+
+    #[test]
+    fn a_lone_never_seen_pattern_keeps_its_state() {
+        let mut t = volume();
+        let quiet = BIRTH + 20 * 86_400;
+        t.push(future(7, 13_000, quiet, "C:\\Users\\bob\\lone.txt"));
+        attach(&mut t, 0.05);
         let lone = t.iter().find(|e| e.meta == "13000").unwrap();
         let row = format_csv_row(lone);
-        assert!(row.ends_with(",candidate,14,rule b_after_c (medium): $SI creation after the record change time; the only record with these rules among the 1 changed in 2026-11-07T03; the clean rate gives 0.04,,"), "{}", row);
+        assert!(row.ends_with(",significant,56,rule future (high): a timestamp more than a day after the timeline was built; 1 of the 1 records changed in 2026-11-15T03 carry future and no clean hour has that pattern,,"), "{}", row);
     }
 
     #[test]
@@ -475,8 +531,8 @@ mod tests {
         assert!(matches!(inside.context.as_deref(), Some(Context::Installed(_))));
         assert!(format_csv_row(inside).contains(",baseline,,rule usn_basic_info (high)"), "{}", format_csv_row(inside));
         let later = t.iter().find(|e| e.source == source::USN && e.meta == "52").unwrap();
-        assert!(matches!(later.context.as_deref(), Some(Context::Burst { leader: true, .. })), "alone in its hour: more than one in 42 gives: {:?}", later.context);
-        assert!(format_csv_row(later).contains(",significant,16,rule usn_basic_info (high)"), "{}", format_csv_row(later));
+        assert!(matches!(later.context.as_deref(), Some(Context::Chance(_))), "a journal record of a timestamp change alone in its hour: every clean hour has some: {:?}", later.context);
+        assert!(format_csv_row(later).contains(",habitual,0,rule usn_basic_info (high)"), "{}", format_csv_row(later));
     }
 
     #[test]
@@ -486,8 +542,7 @@ mod tests {
         let s = attach(&mut t, 0.05);
         assert!(s[0].install.is_none());
         // without a window the installation itself is one burst
-        assert_eq!(s[0].bursts, 2, "the 399 b_after_c records fall in two hours");
-        assert_eq!(s[0].chance, 0);
+        assert_eq!((s[0].bursts, s[0].chance), (0, 399), "the 399 b_after_c records fall in two hours that clean hours cannot judge rarer than one in fifteen");
     }
 
     #[test]

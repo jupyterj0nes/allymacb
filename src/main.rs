@@ -105,7 +105,7 @@ fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContex
         }
         if v.bursts > 0 {
             eprintln!(
-                "[*] {}: {} burst(s) of records with the same rules changed in the same hour, more than their clean rate gives; the first of each keeps its state, the other {} are `habitual`",
+                "[*] {}: {} burst(s) of records with the same rules changed in the same hour, a share no clean hour reaches; the first of each keeps its state, the other {} are `habitual`",
                 v.place, v.bursts, v.folded
             );
         }
@@ -117,7 +117,7 @@ fn report_anomalies(timeline: &[TimelineEntry], volumes: &[context::VolumeContex
         eprintln!("[*] {} file(s) folded into a burst: `habitual`, `same burst as record` in hunt_why points at the first", folded.len());
     }
     if !chance.is_empty() {
-        eprintln!("[*] {} file(s) whose rules are what the clean rate gives for the records changed in their hour: `habitual`", chance.len());
+        eprintln!("[*] {} file(s) whose rules clean hours also show at that share of the records changed in their hour: `habitual`", chance.len());
     }
 }
 
