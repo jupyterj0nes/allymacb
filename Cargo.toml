@@ -12,10 +12,13 @@ ewf = "0.4.10"
 ext4-view = "1.0.0"
 flate2 = "1.1.10"
 indicatif = "0.18.6"
+lvm2 = "0.0.3"
 mbrman = "0.6.1"
 mft = "0.7.0"
 ntfs = "0.4.0"
 rayon = "1.12.0"
+rust-fs-core = { version = "0.3", default-features = false }
+rust-fs-xfs = { version = "0.14", default-features = false }
 tar = "0.4.46"
 vshadow = "0.2.0"
 walkdir = "2.5.0"

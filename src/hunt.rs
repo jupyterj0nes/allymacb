@@ -81,8 +81,10 @@ impl Macb {
 pub enum Evidence {
     /// One NTFS `FILE` record: `$STANDARD_INFORMATION` and every `$FILE_NAME`.
     Ntfs { entry: u64, seq: u16, si: Macb, fns: Vec<Macb> },
-    /// One Unix inode state.
-    Unix { inode: u64, t: Macb },
+    /// One Unix inode state; `root` for the root directory of its volume
+    /// (inode 2 on ext2/3/4, the superblock's root inode on XFS), whose
+    /// birth is the volume's.
+    Unix { inode: u64, t: Macb, root: bool },
     /// One USN record, joined to the NTFS record with the same reference.
     Usn { entry: u64, seq: u16, reason: u32, time: Ts },
 }
@@ -549,8 +551,8 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
                 }
                 note_subsec(&mut v.subsec, si);
             }
-            Evidence::Unix { inode, t } => {
-                if *inode == 2 && u.source != source::CARVED {
+            Evidence::Unix { t, root, .. } => {
+                if *root && u.source != source::CARVED {
                     v.birth = t.b;
                 }
                 note_subsec(&mut v.subsec, t);

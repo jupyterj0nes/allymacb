@@ -145,7 +145,7 @@ fn unix_row(volume: u32, inode: u64, name: &str, t: Macb) -> TimelineEntry {
     let secs = t.c.map(|c| c.0).unwrap_or(0);
     TimelineEntry::new(String::new(), secs, 0, 1, "..c.".into(), "-rw-r--r--".into(), 0, 0, inode.to_string(), name.into())
         .with_source(source::EXT4)
-        .with_hunt(Some(hunt::record(volume, Evidence::Unix { inode, t })))
+        .with_hunt(Some(hunt::record(volume, Evidence::Unix { inode, t, root: inode == 2 })))
 }
 
 #[test]

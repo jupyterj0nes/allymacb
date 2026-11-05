@@ -754,7 +754,7 @@ pub fn parse_ext4_raw<R: Read + Seek>(reader: R, base: u64, carve: bool) -> Resu
     let mut out = Vec::new();
     let volume = hunt::new_volume();
     // One hunt record per inode state, shared by every path (hard links) of it.
-    let hunt_of = |i: &Inode| Some(hunt::record(volume, hunt::Evidence::Unix { inode: u64::from(i.num), t: unix_macb(i) }));
+    let hunt_of = |i: &Inode| Some(hunt::record(volume, hunt::Evidence::Unix { inode: u64::from(i.num), t: unix_macb(i), root: i.num == ROOT_INODE }));
 
     // --- live tree ----------------------------------------------------------
     let live = fs.walk()?;

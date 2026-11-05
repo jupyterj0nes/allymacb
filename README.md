@@ -3,13 +3,13 @@
   <br><br>
   <strong>The filesystem timeline, and the files whose timestamps lie.</strong>
   <br>
-  <code>$MFT</code>, <code>$UsnJrnl</code>, ext4, bodyfiles, disk images and triage packages in one CSV. Timestomping flagged, deleted files carved back, a statistical hunt on top. One binary, no dependencies.
+  <code>$MFT</code>, <code>$UsnJrnl</code>, ext4, XFS, LVM, bodyfiles, disk images and triage packages in one CSV. Timestomping flagged, deleted files carved back, a statistical hunt on top. One binary, no dependencies.
   <br><br>
 
   <a href="https://github.com/jupyterj0nes/allymacb/releases/latest"><img src="https://img.shields.io/github/v/release/jupyterj0nes/allymacb?label=release" alt="Release"></a>
   <a href="https://github.com/jupyterj0nes/allymacb/releases/latest"><img src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-stable-orange?logo=rust" alt="Rust"></a>
-  <a href="docs/validation.md"><img src="https://img.shields.io/badge/tests-593%20passing-brightgreen" alt="Tests"></a>
+  <a href="docs/validation.md"><img src="https://img.shields.io/badge/tests-599%20passing-brightgreen" alt="Tests"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPLv3-blue.svg" alt="License: AGPL v3"></a>
 
 </div>
@@ -24,7 +24,7 @@
 
 An intrusion leaves its traces in the filesystem: the dropper's creation time, the deleted tool, the log wiped from `/var/log`, the timestamps moved back to blend in. allymacb reads the filesystem's own records and puts every timestamp in one timeline, in the MACB format of `mactime`, in UTC.
 
-- **One timeline from any filesystem evidence.** NTFS `$MFT` and `$UsnJrnl:$J`, ext2/3/4 read from the disk structures, TSK bodyfiles (UAC and other Linux collectors), E01, raw, split raw and fixed VHD images with GPT or MBR, ZIP and TAR triage packages (KAPE, Velociraptor, UAC), and plain directories. Nothing to mount, nothing to extract by hand. [Inputs ↓](#what-it-reads)
+- **One timeline from any filesystem evidence.** NTFS `$MFT` and `$UsnJrnl:$J`, ext2/3/4 read from the disk structures, XFS (the default of RHEL, Rocky, Alma and Oracle Linux), plain or inside LVM, TSK bodyfiles (UAC and other Linux collectors), E01, raw, split raw and fixed VHD images with GPT or MBR, ZIP and TAR triage packages (KAPE, Velociraptor, UAC), and plain directories. Nothing to mount, nothing to extract by hand. [Inputs ↓](#what-it-reads)
 - **Points at the timestamps that were tampered with.** Twelve rules catch timestomping and name tricks: `$SI` against `$FILE_NAME`, whole-second times, changes the journal saw, older carved copies that are newer than the live record, right-to-left overrides, double extensions. Each rule's weight is measured on clean Windows and Linux machines, not guessed. The volume's own history (its installation, its normal hours) explains away what a clean machine does too. On three clean hosts the result is zero alerts. [Anti-forensics →](docs/anti-forensics.md)
 - **Hunts with statistics, not thresholds.** Give it the day the incident started. Every record touched since then is tested against everything the volume did before, and the ones that survive a false-discovery-rate test are kept. It is the method of [masstin](https://github.com/jupyterj0nes/masstin)'s graph-hunt, moved from logins to file records. [Statistical hunt →](docs/hunt.md)
 - **Brings back what was deleted.** `--carve` reads every sector for old `$MFT` records and `$I30` index entries, replays the ext4 journal to name deleted files, and recovers log lines and `utmp` records from free space. On a quick-formatted volume it gets back all 87 original files with their paths. [Carving →](docs/carving.md)
@@ -76,10 +76,10 @@ One row per timestamp. The columns you will filter on most:
 | Column | What it tells you |
 |---|---|
 | `type` | Which timestamps the row stands for: `m` modified, `a` accessed, `c` metadata changed, `b` born (created), as in `mactime` |
-| `source` | `mft`, `usn`, `ext4`, `bodyfile`, `fs` or `carved`: a carved row is a different kind of evidence, and the column says so |
+| `source` | `mft`, `usn`, `ext4`, `xfs`, `bodyfile`, `fs` or `carved`: a carved row is a different kind of evidence, and the column says so |
 | `deleted` | `unallocated`, `dtime` or `usn` when the file is known to be gone |
 | `meta` | Inode or MFT record number: what ties the rows of one file together |
-| `evidence` | Where the row came from, outermost first: `disk.E01:p2:$MFT`, `kape.zip:C/$MFT` |
+| `evidence` | Where the row came from, outermost first: `disk.E01:p2:$MFT`, `kape.zip:C/$MFT`, `rhel.E01:p2:rl/root` (a logical volume) |
 | `hunt` | `significant` or `candidate` when a rule or the hunt speaks; `baseline` / `habitual` when the volume vouches for the file |
 | `hunt_score` | How rare, 0 to 100, ten points per order of magnitude: `>= 30` keeps what is rarer than one in a thousand |
 | `hunt_why` | Why, in words: `rule <id> (<level>): …` for the rules, plain sentences for the hunt |
@@ -95,9 +95,11 @@ All 19 columns, what each source fills, exit codes and error codes: [Output →]
 | `$UsnJrnl:$J` | `-u`, or name (`$UsnJrnl%3A$J`, `$J` under `$Extend`) | USN V2 and V3; V4 range records skipped and counted |
 | Bodyfile (TSK 3.x) | name (`bodyfile`, `*.body`) or content | UAC and other Linux collectors |
 | E01 / EWF | `.e01`, `.ex01` | |
-| Raw images | `.dd`, `.raw`, `.img`, split `.001`, or boot sector / GPT / MBR | GPT, MBR with extended partitions, 512 and 4096-byte sectors; NTFS and ext4 partitions timelined |
+| Raw images | `.dd`, `.raw`, `.img`, split `.001`, or boot sector / GPT / MBR | GPT, MBR with extended partitions, 512 and 4096-byte sectors; NTFS, ext4, XFS and LVM partitions timelined |
 | Fixed VHD | footer | |
 | ext2 / ext3 / ext4 | partition in an image, or a bare filesystem image | Read from the disk structures: inode numbers, ctime, deleted inodes, the jbd2 journal with `--carve` |
+| XFS | `XFSB` superblock: partition, logical volume or bare image | Every inode of every allocation group: `crtime` and nanoseconds on v5, freed inodes with their creation and deletion times, names of removed entries from directory slack. Through the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) driver faramir uses |
+| LVM2 | `LABELONE` physical volume label | Every linear logical volume is opened and its ext4 (with its journal) or XFS read; `volume` names it `p2:vg/lv` |
 | Archives | `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.gz` | Streamed; every `$MFT`, `$J` and bodyfile inside parsed, one level of nesting included |
 | Directories | `-d` | KAPE, Velociraptor or UAC output, or a plain tree (timelined from its metadata, with a warning) |
 | Raw sectors | `--carve` | NTFS records and `$I30` entries anywhere, the ext4 journal, log lines and `utmp` records in free space, through the [blockcarve](https://github.com/jupyterj0nes/blockcarve) crate shared with masstin, faramir and caarea |
@@ -145,6 +147,8 @@ Every number in this README was measured. The details are in [How it was checked
 ## Limitations
 
 * ext4: `meta_bg` layouts and inline-data directories fall back to `ext4-view`, which has no ctime and no inode numbers. Names of deleted files come only from the journal. File contents are not recovered: that is PhotoRec's job.
+* XFS: a freed inode keeps its times but not its type or size. Its name comes back only from the slack of a directory stored in blocks; a small directory kept inside its inode is compacted on removal and keeps nothing. The log holds operations, not block copies, so there are no older inode states as on ext4.
+* LVM: linear logical volumes that lie on the physical volume being read. A volume that is striped, mirrored, thin or spread over a second disk is reported as unreadable and the exit code says the timeline is partial. `--carve` does not look for logs in the free space of a logical volume.
 * A non-resident `$ATTRIBUTE_LIST` cannot be followed from a loose `$MFT`.
 * USN rows carry the record's name and MFT entry, not a full path.
 * VHDX, VMDK, dynamic VHD, QCOW and VDI are not decoded.
@@ -158,7 +162,7 @@ Every number in this README was measured. The details are in [How it was checked
 | [Output](docs/output.md) | The 19 columns against masstin's, what each source fills, orphans, CSV escaping, stdout and stderr, exit and error codes |
 | [Anti-forensics indicators](docs/anti-forensics.md) | The twelve rules, what else produces each one, their measured rarity, the installation window and the clean hours |
 | [Statistical hunt](docs/hunt.md) | How `--investigation-from` tests a record, the score scale, the findings table, where the numbers stop |
-| [Carving](docs/carving.md) | `FILE` and `$I30` carving and deduplication against the live `$MFT`, the ext4 journal, logs and `utmp` in free space |
+| [Carving](docs/carving.md) | `FILE` and `$I30` carving and deduplication against the live `$MFT`, the ext4 journal, XFS directory slack, logs and `utmp` in free space |
 | [How it was checked](docs/validation.md) | Every comparison against independent tools and lab volumes with a known truth, and the test suite |
 | [CHANGELOG](CHANGELOG.md) | What changed, release by release |
 

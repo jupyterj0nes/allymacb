@@ -24,6 +24,10 @@ pub enum ErrorCode {
     Ext4SuperblockInvalid = 4001,
     Ext4DirectoryTraversalFailed = 4002,
     Ext4MetadataReadFailed = 4003,
+    // XFS and LVM (E41xx, E42xx)
+    XfsSuperblockInvalid = 4101,
+    XfsMetadataReadFailed = 4102,
+    LvmMetadataInvalid = 4201,
 
     // Archives (E5xxx)
     ArchiveDecompressionFailed = 5001,
@@ -68,6 +72,9 @@ impl ErrorCode {
             ErrorCode::Ext4SuperblockInvalid => "ERR_EXT4_SUPERBLOCK_4001",
             ErrorCode::Ext4DirectoryTraversalFailed => "ERR_EXT4_TRAVERSAL_4002",
             ErrorCode::Ext4MetadataReadFailed => "ERR_EXT4_METADATA_4003",
+            ErrorCode::XfsSuperblockInvalid => "ERR_XFS_SUPERBLOCK_4101",
+            ErrorCode::XfsMetadataReadFailed => "ERR_XFS_METADATA_4102",
+            ErrorCode::LvmMetadataInvalid => "ERR_LVM_METADATA_4201",
             ErrorCode::ArchiveDecompressionFailed => "ERR_ARCHIVE_DECOMPRESS_5001",
             ErrorCode::ArchiveCorrupt => "ERR_ARCHIVE_CORRUPT_5002",
             ErrorCode::ArchiveUnsupportedFormat => "ERR_ARCHIVE_UNSUPPORTED_5003",
@@ -196,7 +203,7 @@ impl fmt::Display for AllyError {
                 write!(f, "[{}] USN Journal at offset 0x{:X}: {}", code, offset, message)
             }
             AllyError::Ext4 { code, message } => {
-                write!(f, "[{}] Linux ext4 Error: {}", code, message)
+                write!(f, "[{}] Linux filesystem error: {}", code, message)
             }
             AllyError::Archive { code, path, message } => {
                 write!(f, "[{}] Archive '{}': {}", code, path, message)

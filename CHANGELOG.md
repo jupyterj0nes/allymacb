@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### XFS and LVM
+
+RHEL, Rocky, Alma and Oracle Linux install XFS, and put the root in LVM; Ubuntu Server puts its ext4 in LVM too. Until now allymacb saw neither.
+
+- **XFS** (`source` = `xfs`), read with the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) driver faramir uses, as a partition, a logical volume or a bare image. The tree is walked from the superblock's root inode, and every inode of every allocation group is read from the inode B+trees, 64 at a time: four times with nanoseconds, `crtime` on v5 filesystems. A freed inode keeps its creation time and the time of its last change, usually the deletion: it is a row with `deleted` = `unallocated`. Its name comes back from the free runs of a directory stored in blocks, where removal leaves the low half of the inode number and the name (`(dir slack)`); a short-form directory keeps nothing. In-use inodes no path reaches are `/[UNKNOWN]/inode_N`. With `--carve`, the free space of a plain XFS partition comes from its free-space B+trees.
+- **LVM2** physical volumes are recognised by their label, in a partition or as a bare image, and every linear logical volume is read as the ext4 (journal included) or XFS it holds, through the `lvm2` crate. `volume` and `evidence` name it `p1:vg/lv`. A volume that is striped, mirrored, thin or partly on another disk is reported as unreadable and the timeline is partial (exit 3), not silently skipped.
+- The volume's birth, which starts the installation window, is the root directory's creation on every Unix filesystem: inode 2 on ext2/3/4, the superblock's root inode on XFS, the `/` line of a bodyfile.
+- Error codes `E4101` (XFS superblock), `E4102` (XFS root directory unreadable) and `E4201` (LVM metadata).
+- Checked on faramir's fixtures, built on a real host: GPT with XFS, MBR with LVM and XFS, MBR with LVM and ext4. Every file of the populated root, `crtime` and nanoseconds, the freed inodes with the deletion time matching their directory's change, and the three removed files named by the ext4 journal through the logical volume. `scripts/xfs_lab.sh` builds an XFS volume with a large directory, deletions and timestomps, and a `stat` truth file, for the directory-slack names.
+
 ## v0.2.0 — 2026-11-05
 
 The CSV changes shape: 19 columns laid out like masstin's instead of 10, and the `flags` column is gone (the rules speak in the analysis tail). Readers of the 0.1 layout need updating.

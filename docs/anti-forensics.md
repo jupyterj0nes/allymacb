@@ -63,7 +63,7 @@ A pattern that never fired is not "never". It gets the bound the volume gives, o
 | `backdated` (high) | | no carving on the reference | not measured, 0 |
 | `m_before_b` on an NTFS record | | | not measured, 0 |
 
-NTFS records use the NTFS rarities; ext4, bodyfile and directory-walk records use the Unix ones.
+NTFS records use the NTFS rarities; ext4, XFS, bodyfile and directory-walk records use the Unix ones.
 
 **Why two rules are worth nothing.**
 * On a stock Ubuntu root nearly every file has a modification time older than its creation, because packages ship files with the mtime of their build. That makes `m_before_b` noise on Unix.

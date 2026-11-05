@@ -175,7 +175,9 @@ fn hunt_record(line: &str, volume: u32) -> Option<Arc<HuntRecord>> {
         // Sequence 0: unknown, so the allocation-order check stays out.
         hunt::Evidence::Ntfs { entry: inode, seq: 0, si: macb, fns: Vec::new() }
     } else {
-        hunt::Evidence::Unix { inode, t: macb }
+        // The root directory: inode 2 on ext2/3/4, the line for `/` otherwise (XFS).
+        let root = inode == 2 || fields[9].split_once('|').map(|(_, n)| n.trim_end_matches('/') == "").unwrap_or(false);
+        hunt::Evidence::Unix { inode, t: macb, root }
     };
     Some(hunt::record(volume, evidence))
 }

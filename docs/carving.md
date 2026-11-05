@@ -34,6 +34,12 @@ ext4 has no carvable record format, but it has a journal (jbd2) that keeps a cop
 
 The journal is small and circular (4 MiB on the lab volume, 128 MiB to 1 GiB on real systems), so it reaches back hours or days, not months.
 
+## XFS: names in directory slack
+
+XFS has no journal of block copies either: its log records operations. What it keeps is in the directory blocks. Removing an entry overwrites only its first four bytes (a free tag and a length); the low half of the inode number, the name length and the name stay until the space is reused. allymacb reads the free runs of every directory stored in blocks and gives a freed inode whose number matches such a remnant its path back, tagged `(dir slack)`. This needs no `--carve`: it reads the live directory blocks, not raw sectors. A directory small enough to live inside its own inode (a handful of entries) is compacted on removal and keeps nothing; its deleted files stay `/[UNKNOWN]/inode_N`, with their times.
+
+With `--carve`, the free space of a plain XFS partition comes from its free-space B+trees. The free space of a logical volume does not map to the image in a straight line, so an LVM partition is not searched for logs; an ext4 inside it still gets its journal read.
+
 ## Timestamped artifacts in free space
 
 Deleted or rotated logs leave their lines in unallocated blocks, and every line carries its own time. With `--carve`, the free space of each volume (from the ext4 block bitmaps or the NTFS `$Bitmap`; the gaps between partitions too) is searched for:

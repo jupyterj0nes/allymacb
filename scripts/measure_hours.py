@@ -23,7 +23,7 @@ import sys
 RULE = re.compile(r'rule (\w+) \(')
 # the timestomp signature is measured as one pattern, as src/anomaly.rs scores it
 PAIR = 'si_before_fn+si_subsec_zero'
-KINDS = {'ntfs': ('mft',), 'usn': ('usn',), 'unix': ('bodyfile', 'ext4', 'fs')}
+KINDS = {'ntfs': ('mft',), 'usn': ('usn',), 'unix': ('bodyfile', 'ext4', 'xfs', 'fs')}
 
 
 def hours_of(path, sources, exclude):

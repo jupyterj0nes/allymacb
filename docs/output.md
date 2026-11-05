@@ -25,13 +25,13 @@ The 19 columns are those of [masstin's timeline](https://github.com/jupyterj0nes
 | 2 | `dst_computer` | `host` | The collection the row came from: the name of a UAC or KAPE archive, or the stem of a bodyfile (`server01.body`). Empty for a loose `$MFT` or an image. |
 | 3 | `event_type` | `action` | What happened to the file, when the evidence says it: `created`, `deleted`, `renamed`, `modified` or `metadata`. Only USN rows carry it for now. |
 | 4 | `event_id` | `type` | MACB flags of that timestamp (`macb`, `m...`, `.a..`, `..c.`, `...b`, combinations, or `....` for USN rows). |
-| 5 | `logon_type` | `source` | What the row was built from: `mft`, `usn`, `bodyfile`, `ext4`, `fs` (host filesystem metadata of a directory walk or an extracted archive) or `carved`. |
+| 5 | `logon_type` | `source` | What the row was built from: `mft`, `usn`, `bodyfile`, `ext4`, `xfs`, `fs` (host filesystem metadata of a directory walk or an extracted archive) or `carved`. |
 | 6 | `target_user_name` | `uid` | Unix owner, `0` for NTFS. |
 | 7 | `target_domain_name` | `gid` | Unix group, `0` for NTFS. |
-| 8 | `src_computer` | `volume` | `C:` for a loose `$MFT` or `$J` (the drive letter of `-m`), `p1`, `p2`... for the partitions of an image in the order they were found. |
+| 8 | `src_computer` | `volume` | `C:` for a loose `$MFT` or `$J` (the drive letter of `-m`), `p1`, `p2`... for the partitions of an image in the order they were found, `p2:vg/lv` for a logical volume in an LVM partition. |
 | 9 | `src_ip` | `size` | File size in bytes. |
 | 10 | `subject_user_name` | `mode` | `ls -l` style permissions. NTFS has none, so NTFS rows use the `mactime` convention `-/-rwxrwxrwx` and `d/drwxrwxrwx`. |
-| 11 | `subject_domain_name` | `deleted` | How the file is known to be deleted: `unallocated` (NTFS record not in use, ext4 inode without links), `dtime` (ext4 inode with a deletion time), `usn` (USN record with `FILE_DELETE`). Empty for a live file. |
+| 11 | `subject_domain_name` | `deleted` | How the file is known to be deleted: `unallocated` (NTFS record not in use, ext4 inode without links, freed XFS inode), `dtime` (ext4 inode with a deletion time), `usn` (USN record with `FILE_DELETE`). Empty for a live file. |
 | 12 | `logon_id` | `meta` | Inode or MFT record number: what ties the rows of one file together. |
 | 13 | `detail` | `file_name` | Full path, with tags: `($FILE_NAME: name)`, `(USN: REASON+REASON)`, `($I30)`, `(carved @0xOFFSET)`. |
 | 14 | `log_filename` | `evidence` | The input the row was read from, outermost first: `disk.E01:p2:$MFT`, `kape.zip:C/$MFT`, `triage:C/$Extend/$UsnJrnl%3A$J`. |
@@ -53,6 +53,8 @@ Every column is RFC 4180 escaped. `meta` and `file_name` come from the evidence,
 | `$UsnJrnl:$J` | | | | | Rows are `....` with the reason flags in the name; `action` and `deleted` come from them. |
 | Bodyfile | yes | yes | yes | yes | Split from the right, so a `\|` inside a path does not shift the columns. `0` means unset. Lines with non-numeric uid, gid or size are rejected and counted. |
 | ext4 | yes | yes | yes | yes | Read from the on-disk structures: inode number in `meta`, `ctime`, timestamps past 2038, and the inodes still marked deleted in the tables, with `deleted` set. SUID, SGID, sticky and device types are rendered. ext2 and ext3 block maps are followed too. |
+| XFS | yes | yes | yes | yes (v5) | Every inode of every allocation group, read with the [rust-fs-xfs](https://github.com/antimatter-studios/rust-fs-xfs) driver: inode number in `meta`, nanoseconds, `crtime` on v5 filesystems (the default since RHEL 7.3). Freed inodes keep their creation time and the time of their last change (usually the deletion): `deleted` is `unallocated`, the name comes from directory slack when it survives (`(dir slack)`), otherwise `/[UNKNOWN]/inode_N`. |
+| LVM2 | | | | | Not a filesystem: each linear logical volume of a physical volume is read as the ext4 or XFS it holds, with `volume` set to `p2:vg/lv`. |
 | Directory walk | yes | yes | Unix only | yes | Timestamps come from the host filesystem, and the tool says so. Real mode, uid, gid and inode on Unix hosts. |
 | Archive without artifacts | yes | | | | A zip or tar only preserves modification times. |
 | Carved `FILE` record | yes | yes | yes | yes | Same rows as a live record (`-n` applies), tagged `(carved @0xOFFSET)` with the absolute offset in the image or file. `source` is `carved`. |
@@ -90,11 +92,14 @@ Anything skipped is reported: unreadable images, corrupt archives, rejected body
 | E4001 | `ERR_EXT4_SUPERBLOCK_4001` | ext4 superblock missing or corrupt |
 | E4002 | `ERR_EXT4_TRAVERSAL_4002` | Directory could not be read |
 | E4003 | `ERR_EXT4_METADATA_4003` | Inode metadata could not be read |
+| E4101 | `ERR_XFS_SUPERBLOCK_4101` | XFS superblock missing, corrupt or of a version the driver refuses |
+| E4102 | `ERR_XFS_METADATA_4102` | XFS inode or directory could not be read |
+| E4201 | `ERR_LVM_METADATA_4201` | LVM physical volume label or metadata could not be read |
 | E5001 | `ERR_ARCHIVE_DECOMPRESS_5001` | Decompression failed |
 | E5002 | `ERR_ARCHIVE_CORRUPT_5002` | Archive structure corrupted |
 | E5003 | `ERR_ARCHIVE_UNSUPPORTED_5003` | Archive type not supported |
 | E6001 | `ERR_IMAGE_READ_6001` | Image read or seek failure |
-| E6002 | `ERR_IMAGE_PARTITION_6002` | No NTFS or ext4 filesystem found |
+| E6002 | `ERR_IMAGE_PARTITION_6002` | No NTFS, ext4, XFS or LVM volume found |
 | E6003 | `ERR_IMAGE_UNSUPPORTED_6003` | VHDX, VMDK, dynamic VHD, QCOW or VDI container |
 | E7001 | `ERR_BODYFILE_FIELDS_7001` | Bodyfile line does not have 11 fields |
 | E7002 | `ERR_BODYFILE_TIMESTAMP_7002` | Non-numeric timestamp in a bodyfile line |

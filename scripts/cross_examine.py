@@ -41,7 +41,7 @@ def run(args, name, extra=()):
             header = next(r, None)
             assert header == ['time_created', 'host', 'action', 'type', 'source', 'uid', 'gid', 'volume', 'size', 'mode', 'deleted', 'meta', 'file_name', 'evidence', 'hunt', 'hunt_score', 'hunt_why', 'verdict', 'notes'], header
             for full in r:
-                if len(full) != 19 or full[4] not in ('mft', 'usn', 'bodyfile', 'ext4', 'fs', 'carved'):
+                if len(full) != 19 or full[4] not in ('mft', 'usn', 'bodyfile', 'ext4', 'xfs', 'fs', 'carved'):
                     bad += 1
                     continue
                 # The checks below index the columns the way they were read
@@ -57,7 +57,10 @@ def run(args, name, extra=()):
                     int(row[1]); int(row[4]); int(row[5])
                     assert len(row[2]) == 4 and all(c in 'macb.' for c in row[2])
                     assert full[14] in ('', 'significant', 'candidate', 'not_evaluated', 'habitual', 'baseline')
-                    assert not rules or full[15] != '', 'a rule always scores, 0 when not measured'
+                    # A state that rests on a test or a rule carries its score
+                    # (0 when not measured); a rule measured as noise gives
+                    # no state and no score, only its clause.
+                    assert full[14] not in ('significant', 'candidate') or full[15] != ''
                     assert full[15] == '' or 0 <= int(full[15]) <= 100
                     assert full[10] in ('', 'unallocated', 'dtime', 'usn')
                     assert full[2] in ('', 'created', 'deleted', 'renamed', 'modified', 'metadata')

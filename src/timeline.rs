@@ -18,6 +18,8 @@ pub mod source {
     pub const BODYFILE: &str = "bodyfile";
     /// ext4 inode read from a disk image.
     pub const EXT4: &str = "ext4";
+    /// XFS inode read from a disk image (plain partition or LVM volume).
+    pub const XFS: &str = "xfs";
     /// Metadata of a file on the analyst's own filesystem (directory walk,
     /// extracted archive).
     pub const FS: &str = "fs";

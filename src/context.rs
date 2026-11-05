@@ -218,7 +218,7 @@ fn gather(timeline: &[TimelineEntry]) -> Vec<Rec> {
                 times(si).chain(fns.iter().flat_map(times)).max(),
                 if *entry == 0 { secs(si.b) } else { None },
             ),
-            Evidence::Unix { inode, t } => (Kind::Unix, secs(t.c).or(secs(t.m)).or(secs(t.b)), times(t).max(), if *inode == 2 { secs(t.b) } else { None }),
+            Evidence::Unix { t, root, .. } => (Kind::Unix, secs(t.c).or(secs(t.m)).or(secs(t.b)), times(t).max(), if *root { secs(t.b) } else { None }),
             Evidence::Usn { time, .. } => (Kind::Usn, Some(time.0), Some(time.0), None),
         };
         index.insert(h.unit, recs.len());
@@ -257,7 +257,8 @@ pub fn attach(timeline: &mut [TimelineEntry], alpha: f64) -> Vec<VolumeContext> 
         let evidence = first.evidence.as_deref().map(|e| e.rsplit(['\\', '/', ':']).next().unwrap_or(e).to_string());
         let mut parts: Vec<&str> = Vec::new();
         for part in [first.host.as_deref(), first.volume.as_deref(), evidence.as_deref()].into_iter().flatten() {
-            if !parts.contains(&part) {
+            // `p1:vg/root` already ends with the evidence's last name, `root`.
+            if !parts.iter().any(|p| p.ends_with(part)) {
                 parts.push(part);
             }
         }

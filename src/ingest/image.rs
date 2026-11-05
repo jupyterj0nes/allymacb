@@ -12,10 +12,13 @@ use crate::timeline::TimelineEntry;
 
 use super::archive::staging_path;
 use super::carve::{carve_stream, describe_stats, VolumeContext};
+use super::device::{LvDevice, SharedReader};
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EXT_MAGIC_OFFSET: u64 = 1080;
 const EXT_MAGIC: [u8; 2] = [0x53, 0xEF];
+/// LVM2 physical volume label, in one of the first four sectors.
+const LVM_LABEL: &[u8; 8] = b"LABELONE";
 const GPT_SIGNATURE: &[u8] = b"EFI PART";
 const MBR_PROTECTIVE_GPT: u8 = 0xEE;
 const MAX_GPT_ENTRIES: u32 = 1024;
@@ -24,6 +27,9 @@ const MAX_GPT_ENTRIES: u32 = 1024;
 pub enum PartitionType {
     Ntfs,
     Ext4,
+    Xfs,
+    /// An LVM2 physical volume: its logical volumes hold the filesystems.
+    Lvm,
     Unknown,
 }
 
@@ -231,7 +237,112 @@ pub fn detect_partition_type<R: Read + Seek>(reader: &mut R, offset: u64) -> Par
         }
     }
 
+    if reader.seek(SeekFrom::Start(offset)).is_ok() {
+        let mut magic = [0u8; 4];
+        if reader.read_exact(&mut magic).is_ok() && magic == *crate::parsers::xfs::XFS_MAGIC {
+            return PartitionType::Xfs;
+        }
+    }
+
+    for sector in 0..4u64 {
+        if reader.seek(SeekFrom::Start(offset + sector * 512)).is_ok() {
+            let mut label = [0u8; 8];
+            if reader.read_exact(&mut label).is_ok() && &label == LVM_LABEL {
+                return PartitionType::Lvm;
+            }
+        }
+    }
+
     PartitionType::Unknown
+}
+
+/// Filesystem at the start of a logical volume.
+fn lv_filesystem<R: Read + Seek>(lv: &mut R) -> PartitionType {
+    match detect_partition_type(lv, 0) {
+        t @ (PartitionType::Ext4 | PartitionType::Xfs) => t,
+        _ => PartitionType::Unknown,
+    }
+}
+
+/// Lends the image reader to `f` behind a mutex, for readers that keep a
+/// handle to it (the XFS driver, LVM), and takes it back afterwards.
+fn with_shared<R, T>(reader: R, label: &str, f: impl FnOnce(&Arc<Mutex<R>>) -> T) -> Result<(R, T)> {
+    let shared = Arc::new(Mutex::new(reader));
+    let out = f(&shared);
+    let reader = Arc::try_unwrap(shared)
+        .map_err(|_| AllyError::Image { code: ErrorCode::ImageReadFailed, path: label.to_string(), message: "image reader still in use".to_string() })?
+        .into_inner()
+        .map_err(|_| AllyError::Image { code: ErrorCode::ImageReadFailed, path: label.to_string(), message: "Mutex poisoned on image reader".to_string() })?;
+    Ok((reader, out))
+}
+
+/// Absolute extent of a volume and its free space, for the log carver.
+type FreeSpace = ((u64, u64), Vec<(u64, u64)>);
+
+/// What one volume (a partition, or a logical volume in one) gave.
+struct LinuxVolume {
+    /// `p2`, or `p2:vg/lv` for a logical volume.
+    label: String,
+    kind: &'static str,
+    result: Result<(Vec<TimelineEntry>, String)>,
+    free: Option<FreeSpace>,
+}
+
+/// An XFS filesystem on a device; `base` is its offset in the image when
+/// it is a plain partition.
+fn read_xfs(dev: Arc<dyn fs_core::BlockRead>, base: Option<u64>, carve: bool) -> (Result<(Vec<TimelineEntry>, String)>, Option<FreeSpace>) {
+    let result = crate::parsers::xfs::parse_xfs(Arc::clone(&dev)).map(|(t, rep)| (t, crate::parsers::xfs::describe(&rep)));
+    // Free space only maps to image offsets on a plain partition.
+    let free = match (carve, base) {
+        (true, Some(base)) => crate::parsers::xfs::free_ranges(dev).map(|(size, free)| ((base, base + size), free.into_iter().map(|(s, l)| (base + s, l)).collect())),
+        _ => None,
+    };
+    (result, free)
+}
+
+/// Every logical volume of the LVM physical volume at `offset`.
+fn read_lvm<R: Read + Seek + Send + 'static>(shared: &Arc<Mutex<R>>, offset: u64, size: u64, part_label: &str, carve: bool) -> Result<Vec<LinuxVolume>> {
+    let pv = SharedReader::new(Arc::clone(shared), offset, size);
+    let lvm = lvm2::Lvm2::open(pv.clone()).map_err(|e| AllyError::Ext4 { code: ErrorCode::LvmMetadataInvalid, message: format!("LVM: {e:?}") })?;
+    let lvm = Arc::new(lvm);
+    let extent = lvm.extent_size();
+    let lvs: Vec<(String, u64)> = lvm.lvs().map(|lv| (lv.name().to_string(), lv.size_in_extents() * extent)).collect();
+    let mut out = Vec::new();
+    for (name, len) in lvs {
+        let label = format!("{}:{}/{}", part_label, lvm.vg_name(), name);
+        let Some(mut open) = lvm.open_lv_by_name(&name, pv.clone()) else { continue };
+        // The first sectors say which filesystem it holds; a volume that is
+        // not linear, or lies partly on another disk, cannot be read at all.
+        let mut head = vec![0u8; 4096];
+        if let Err(e) = open.seek(SeekFrom::Start(0)).and_then(|_| open.read_exact(&mut head)) {
+            out.push(LinuxVolume {
+                label,
+                kind: "lvm",
+                result: Err(AllyError::Ext4 { code: ErrorCode::LvmMetadataInvalid, message: format!("logical volume cannot be read ({e}): only linear volumes on this physical volume are") }),
+                free: None,
+            });
+            continue;
+        }
+        match lv_filesystem(&mut io::Cursor::new(&head)) {
+            PartitionType::Ext4 => {
+                let result = crate::parsers::ext4raw::parse_ext4_raw(open, 0, carve).map(|(t, rep)| (t, crate::parsers::ext4raw::describe(&rep, carve)));
+                out.push(LinuxVolume { label, kind: "ext4", result, free: None });
+            }
+            PartitionType::Xfs => {
+                drop(open);
+                let dev: Arc<dyn fs_core::BlockRead> = Arc::new(LvDevice { lvm: Arc::clone(&lvm), name: name.clone(), pv: pv.clone(), len });
+                let (result, free) = read_xfs(dev, None, carve);
+                out.push(LinuxVolume { label, kind: "xfs", result, free });
+            }
+            _ => out.push(LinuxVolume {
+                label,
+                kind: "unknown",
+                result: Err(AllyError::Ext4 { code: ErrorCode::Ext4SuperblockInvalid, message: "no ext2/3/4 or XFS filesystem on the logical volume (swap or LUKS, for instance)".to_string() }),
+                free: None,
+            }),
+        }
+    }
+    Ok(out)
 }
 
 fn push_if_fs<R: Read + Seek>(reader: &mut R, offset: u64, image_size: u64, out: &mut Vec<PartitionInfo>) {
@@ -367,7 +478,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
     let no_filesystem = || AllyError::Image {
         code: ErrorCode::ImagePartitionTableCorrupt,
         path: label.to_string(),
-        message: "No NTFS or ext4 filesystem found (checked bare filesystem, GPT, MBR/EBR and common offsets)".to_string(),
+        message: "No NTFS, ext4, XFS or LVM volume found (checked bare filesystem, GPT, MBR/EBR and common offsets)".to_string(),
     };
     if partitions.is_empty() && !mft_options.carve {
         return Err(no_filesystem());
@@ -465,6 +576,60 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                         path: label.to_string(),
                         message: "Mutex poisoned on image reader".to_string(),
                     })?;
+            }
+            PartitionType::Xfs | PartitionType::Lvm => {
+                let size = total_size.saturating_sub(part.offset);
+                let carve = mft_options.carve;
+                let (r, found) = with_shared(reader, label, |sh| {
+                    if part.ptype == PartitionType::Xfs {
+                        let dev: Arc<dyn fs_core::BlockRead> = Arc::new(SharedReader::new(Arc::clone(sh), part.offset, size));
+                        let (result, free) = read_xfs(dev, Some(part.offset), carve);
+                        Ok(vec![LinuxVolume { label: part_label.clone(), kind: "xfs", result, free }])
+                    } else {
+                        read_lvm(sh, part.offset, size, &part_label, carve)
+                    }
+                })?;
+                reader = r;
+                let found = match found {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("[!] LVM partition @0x{:X} in {}: {}", part.offset, label, e);
+                        Vec::new()
+                    }
+                };
+                if part.ptype == PartitionType::Lvm && !mft_options.quiet {
+                    eprintln!("    [i] LVM @0x{:X}: {} logical volume(s)", part.offset, found.len());
+                }
+                let mut free_space = None;
+                for v in found {
+                    match v.result {
+                        Ok((mut timeline, desc)) => {
+                            super::stamp(&mut timeline, Some(&v.label), Some(&v.label), None);
+                            if !mft_options.quiet {
+                                eprintln!("    [+] {} {}: {}", v.kind, v.label, desc);
+                            }
+                            combined_timeline.extend(timeline);
+                        }
+                        Err(e) if v.kind == "unknown" => {
+                            if !mft_options.quiet {
+                                eprintln!("    [i] {}: {}", v.label, e);
+                            }
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("[!] {} {} in {}: {}", v.kind, v.label, label, e);
+                        }
+                    }
+                    free_space = free_space.or(v.free);
+                }
+                if mft_options.carve {
+                    // Logs and utmp records are carved from free space only.
+                    // A logical volume's free space does not map to the image
+                    // in a straight line, so an LVM partition gives none.
+                    let ((start, end), free) = free_space.unwrap_or(((part.offset, u64::MAX), Vec::new()));
+                    volumes.push(VolumeContext { start, end, live_mft: None, free_ranges: free, free_known: true, hunt_volume: None, label: vol_label.clone() });
+                }
             }
             PartitionType::Unknown => {}
         }

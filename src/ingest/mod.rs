@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod carve;
 pub mod carve_text;
+pub mod device;
 pub mod image;
 pub mod triage;
 

@@ -8,7 +8,7 @@ The [anti-forensics indicators](anti-forensics.md) say what a record looks like.
 
 It is the method of masstin's [graph-hunt](https://github.com/jupyterj0nes/masstin/blob/main/docs/graph-hunt-statistics.md), moved from logins to file records:
 
-1. **Unit.** One state of one record: an NTFS `FILE` record (live or carved), an ext4 inode (live, deleted, or an older copy from the journal), a bodyfile line.
+1. **Unit.** One state of one record: an NTFS `FILE` record (live or carved), an ext4 inode (live, deleted, or an older copy from the journal), an XFS inode (live or freed), a bodyfile line.
 2. **When it was touched.** Its latest creation, modification or change time, `$FILE_NAME` copies and USN records included. Access times do not count. An NTFS record used for the first time cannot be older than the first-use record numbered just before it, because NTFS hands out the lowest free record; that neighbour's creation counts too, so a file whose every timestamp was moved back still lands in the window.
 3. **Baseline and window.** Records touched before the cutoff are the baseline, the rest the window. Each volume is compared with itself.
 4. **What is measured.** For every record, how far each timestamp relation is from what the filesystem writes on its own:
