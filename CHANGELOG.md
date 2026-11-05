@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 — 2026-11-05
+
+The CSV changes shape: 19 columns laid out like masstin's instead of 10, and the `flags` column is gone (the rules speak in the analysis tail). Readers of the 0.1 layout need updating.
+
+### A README that reads in two minutes
+
+- The README opens with a pop-art logo (a comic clock with M, A, C and B on its face and an exclamation mark for a hand: the timeline that objects; `resources/allymacb_icon.svg` and a 512 px PNG for the avatar), badges and two recorded demos: the statistical hunt on the NIST `$MFT` with 20 timestomps, and `--carve` bringing back the files of a quick-formatted volume. Then what it does, a "you have / run" table, the columns you filter on, what it reads, how it was checked in five lines and the limitations.
+- The detail moved to `docs/`: [output](docs/output.md), [anti-forensics indicators](docs/anti-forensics.md) (now in sections: the rules, what lands in the tail, what a rule is worth, the volume speaks first, examples), [statistical hunt](docs/hunt.md), [carving](docs/carving.md), [how it was checked](docs/validation.md). The demos are recorded with VHS from `resources/vhs/*.tape`.
 
 ### The volume speaks before the rules
 

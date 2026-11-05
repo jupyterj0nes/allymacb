@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300" viewBox="0 0 300 300" role="img" aria-label="allymacb icon: a comic clock with M, A, C and B on its face and an exclamation mark for a hand, on a yellow burst">
+  <defs>
+    <pattern id="dots" width="12" height="12" patternUnits="userSpaceOnUse">
+      <circle cx="6" cy="6" r="2.6" fill="#FF8FA3"/>
+    </pattern>
+  </defs>
+  <rect width="300" height="300" rx="56" fill="#FF5C7A"/>
+  <rect width="300" height="300" rx="56" fill="url(#dots)" opacity="0.6"/>
+
+  <!-- burst -->
+  <path transform="translate(150 150) rotate(-6)" d="M0 -132 L24 -88 L72 -112 L66 -62 L120 -58 L82 -24 L124 12 L74 24 L92 74 L42 60 L22 112 L0 70 L-22 112 L-42 60 L-92 74 L-74 24 L-124 12 L-82 -24 L-120 -58 L-66 -62 L-72 -112 L-24 -88 Z" fill="#FFE14D" stroke="#1F1B2E" stroke-width="8" stroke-linejoin="round"/>
+
+  <!-- the clock -->
+  <g transform="translate(150 150)">
+    <circle r="76" fill="#1F1B2E" transform="translate(6 6)"/>
+    <circle r="76" fill="#FFFFFF" stroke="#1F1B2E" stroke-width="8"/>
+    <g stroke="#1F1B2E" stroke-width="5" stroke-linecap="round">
+      <line x1="38" y1="-38" x2="45" y2="-45"/><line x1="38" y1="38" x2="45" y2="45"/>
+      <line x1="-38" y1="38" x2="-45" y2="45"/><line x1="-38" y1="-38" x2="-45" y2="-45"/>
+    </g>
+    <g font-family="'Arial Black', 'Segoe UI Black', sans-serif" font-weight="900" font-size="26" text-anchor="middle">
+      <text x="0" y="-44" fill="#2FB86A">M</text>
+      <text x="52" y="9" fill="#3D7BFF">A</text>
+      <text x="0" y="64" fill="#F29D00">C</text>
+      <text x="-52" y="9" fill="#FF3D5E">B</text>
+    </g>
+    <!-- the hand is an exclamation mark -->
+    <g transform="rotate(14)">
+      <path d="M-9 -40 L9 -40 L5 4 L-5 4 Z" fill="#FF3D5E" stroke="#1F1B2E" stroke-width="5" stroke-linejoin="round"/>
+      <circle cx="0" cy="22" r="9" fill="#FF3D5E" stroke="#1F1B2E" stroke-width="5"/>
+    </g>
+  </g>
+</svg>
