@@ -33,12 +33,14 @@ pub struct Cli {
     #[arg(short = 'n', long = "file-name")]
     pub include_file_name: bool,
 
-    /// Directory to dump resident files extracted from MFT
-    #[arg(short = 'r', long = "resident")]
+    /// Dump the resident $DATA streams of the MFT into this folder. Off unless given;
+    /// the folder must be new or empty, and no file is ever overwritten (a second
+    /// record with the same path gets `.rec<N>`)
+    #[arg(short = 'r', long = "resident", value_name = "DIR")]
     pub resident: Option<PathBuf>,
 
-    /// Path to output resident file extraction summary report
-    #[arg(long = "resident-report")]
+    /// Summary of the resident dump of the whole run (needs --resident; the file must not exist)
+    #[arg(long = "resident-report", value_name = "FILE")]
     pub resident_report: Option<PathBuf>,
 
     /// Suppress progress bars, banner and informational messages (warnings are still printed)
@@ -65,4 +67,9 @@ pub struct Cli {
     /// Write the hunt's findings table (19 columns, laid out like masstin's) to this CSV
     #[arg(long = "hunt-out", value_name = "CSV")]
     pub hunt_out: Option<PathBuf>,
+
+    /// Threads to use; 0 (the default) uses every logical processor of the system.
+    /// The output is byte for byte the same with any number
+    #[arg(long = "threads", value_name = "N", default_value_t = 0)]
+    pub threads: usize,
 }

@@ -592,7 +592,7 @@ pub fn parse_mft_reader<R: Read + Seek>(
 ) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
     let (mut parser, skipped) = open_mft_parser(reader)?;
     if skipped > 0 {
-        eprintln!(
+        crate::say!(
             "[!] $MFT: first {} record(s) are damaged and were skipped; paths through them will show as [ORPHAN]",
             skipped
         );
@@ -600,7 +600,7 @@ pub fn parse_mft_reader<R: Read + Seek>(
 
     let entry_count = parser.get_entry_count();
 
-    let pb = if !options.quiet {
+    let pb = if !options.quiet && !crate::par::capturing() {
         let pb = ProgressBar::new(entry_count);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -685,34 +685,38 @@ pub fn parse_mft_reader<R: Read + Seek>(
     }
 
     if resident_stats.total_failed > 0 || resident_stats.total_unsafe_paths > 0 {
-        eprintln!(
+        crate::say!(
             "[!] Resident extraction: {} written, {} failed, {} refused (path escaped output directory)",
             resident_stats.total_extracted, resident_stats.total_failed, resident_stats.total_unsafe_paths
         );
     }
 
-    // Write resident extraction report if requested
-    if let Some(ref report_path) = options.resident_report {
-        let mut rep = File::create(report_path).map_err(|e| AllyError::Io {
-            code: ErrorCode::IoError,
-            source: e,
-            context: format!("Creating resident report {}", report_path.display()),
-        })?;
-        writeln!(rep, "=== Resident Files Extraction Summary ===")?;
-        writeln!(rep, "Total resident files extracted: {}", resident_stats.total_extracted)?;
-        writeln!(rep, "Total bytes extracted: {} bytes ({:.2} MB)", resident_stats.total_bytes, resident_stats.total_bytes as f64 / 1_048_576.0)?;
-        writeln!(rep, "Failed writes: {}", resident_stats.total_failed)?;
-        writeln!(rep, "Refused unsafe paths: {}", resident_stats.total_unsafe_paths)?;
-    }
-
+    // The summary report covers every source of the run: the caller writes it
+    // once, with `write_resident_report`, from the stats added up.
     Ok((timeline, resident_stats))
+}
+
+/// Writes the resident dump summary of a whole run.
+pub fn write_resident_report(path: &Path, dir: &Path, stats: &ResidentStats) -> Result<()> {
+    let mut rep = fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| AllyError::Io {
+        code: ErrorCode::IoError,
+        source: e,
+        context: format!("Creating resident report {}", path.display()),
+    })?;
+    writeln!(rep, "=== Resident Files Extraction Summary ===")?;
+    writeln!(rep, "Destination: {}", dir.display())?;
+    writeln!(rep, "Total resident files extracted: {}", stats.total_extracted)?;
+    writeln!(rep, "Total bytes extracted: {} bytes ({:.2} MB)", stats.total_bytes, stats.total_bytes as f64 / 1_048_576.0)?;
+    writeln!(rep, "Failed writes: {}", stats.total_failed)?;
+    writeln!(rep, "Refused unsafe paths: {}", stats.total_unsafe_paths)?;
+    Ok(())
 }
 
 pub fn parse_mft_file(
     mft_path: &Path,
     options: &MftParseOptions,
 ) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
-    let file = File::open(mft_path).map_err(|e| AllyError::Io {
+    let file = crate::evidence::open(mft_path).map_err(|e| AllyError::Io {
         code: ErrorCode::FileNotFound,
         source: e,
         context: format!("Opening MFT file {}", mft_path.display()),
@@ -784,35 +788,18 @@ fn extract_resident_file(
         }
     };
 
-    let mut target_path = out_dir.join(&rel);
-    // Deleted records and live records can share a path: never overwrite one
-    // with the other, and never let two records with the same path collide.
-    if !is_allocated {
-        let name = target_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        target_path.set_file_name(format!("{}.deleted_rec{}", name, record));
-    }
-    if target_path.exists() {
-        let name = target_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        target_path.set_file_name(format!("{}.rec{}", name, record));
-    }
-
+    let target_path = out_dir.join(&rel);
     if let Some(parent) = target_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             stats.total_failed += 1;
             if stats.total_failed <= 5 {
-                eprintln!("[!] Resident dump: cannot create {}: {}", parent.display(), e);
+                crate::say!("[!] Resident dump: cannot create {}: {}", parent.display(), e);
             }
             return;
         }
     }
 
-    let written = File::create(&target_path).and_then(|mut f| f.write_all(data));
+    let written = create_unique(&target_path, record, is_allocated).and_then(|mut f| f.write_all(data));
     match written {
         Ok(()) => {
             stats.total_extracted += 1;
@@ -821,8 +808,30 @@ fn extract_resident_file(
         Err(e) => {
             stats.total_failed += 1;
             if stats.total_failed <= 5 {
-                eprintln!("[!] Resident dump: cannot write {}: {}", target_path.display(), e);
+                crate::say!("[!] Resident dump: cannot write {}: {}", target_path.display(), e);
             }
+        }
+    }
+}
+
+/// Creates the file a resident stream is dumped to, never one that exists:
+/// `name` for a live record, `name.deleted_rec<N>` for a deleted one, then
+/// `.rec<N>` and `.rec<N>_2`, `_3`... when another record, or another source
+/// with the same path, got there first. `create_new` makes the check and the
+/// creation one step, so nothing is overwritten, whatever runs alongside.
+fn create_unique(target: &Path, record: u64, is_allocated: bool) -> io::Result<File> {
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let first = if is_allocated { name.clone() } else { format!("{}.deleted_rec{}", name, record) };
+    let mut attempt = 0u32;
+    loop {
+        let candidate = match attempt {
+            0 => first.clone(),
+            1 => format!("{}.rec{}", first, record),
+            n => format!("{}.rec{}_{}", first, record, n),
+        };
+        match fs::OpenOptions::new().write(true).create_new(true).open(target.with_file_name(&candidate)) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 100_000 => attempt += 1,
+            other => return other,
         }
     }
 }

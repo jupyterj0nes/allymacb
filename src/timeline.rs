@@ -370,6 +370,11 @@ pub fn format_csv_row(entry: &TimelineEntry) -> String {
     )
 }
 
+/// Rows formatted before a write: bounds the text held in memory.
+const WRITE_BATCH: usize = 65_536;
+/// Rows one thread formats in one piece.
+const FORMAT_PIECE: usize = 2_048;
+
 pub struct TimelineWriter;
 
 impl TimelineWriter {
@@ -378,8 +383,11 @@ impl TimelineWriter {
         entries: &mut [TimelineEntry],
         output_path: Option<&Path>,
     ) -> Result<usize> {
-        // Sort chronologically by (secs, nanos, path)
-        entries.sort_by(|a, b| {
+        // Sort chronologically by (secs, nanos, host, path). The sort is stable:
+        // rows equal on all four keep the order the inputs gave them, on any
+        // number of threads.
+        use rayon::prelude::*;
+        entries.par_sort_by(|a, b| {
             a.timestamp_secs
                 .cmp(&b.timestamp_secs)
                 .then_with(|| a.timestamp_nanos.cmp(&b.timestamp_nanos))
@@ -416,11 +424,26 @@ impl TimelineWriter {
             message: format!("Failed writing CSV header: {}", e),
         })?;
 
-        for entry in entries.iter() {
-            writeln!(writer, "{}", format_csv_row(entry)).map_err(|e| AllyError::Csv {
-                code: ErrorCode::CsvExportFailed,
-                message: format!("Failed writing CSV row for '{}': {}", entry.file_name, e),
-            })?;
+        // Rows are formatted a batch at a time on every thread, each piece in
+        // place, and written in order: the file is the one a single thread writes.
+        for batch in entries.chunks(WRITE_BATCH) {
+            let pieces: Vec<String> = batch
+                .par_chunks(FORMAT_PIECE)
+                .map(|rows| {
+                    let mut s = String::with_capacity(rows.len() * 256);
+                    for entry in rows {
+                        s.push_str(&format_csv_row(entry));
+                        s.push('\n');
+                    }
+                    s
+                })
+                .collect();
+            for (k, piece) in pieces.iter().enumerate() {
+                writer.write_all(piece.as_bytes()).map_err(|e| AllyError::Csv {
+                    code: ErrorCode::CsvExportFailed,
+                    message: format!("Failed writing CSV rows from '{}': {}", batch[k * FORMAT_PIECE].file_name, e),
+                })?;
+            }
         }
 
         writer.flush().map_err(|e| AllyError::Csv {

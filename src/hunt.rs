@@ -103,14 +103,76 @@ pub struct HuntRecord {
 static NEXT_VOLUME: AtomicU32 = AtomicU32::new(1);
 static NEXT_UNIT: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    /// Ids handed out so far by the input this thread is parsing, when it runs
+    /// alongside others: numbered from 0, moved to their run-wide numbers by
+    /// [`rebase`] once the inputs before it are known.
+    static SCOPE: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Takes `n` consecutive ids from the scope of this thread, or from the run.
+fn take_ids(volumes: u32, units: u64) -> (u32, u64) {
+    SCOPE.with(|s| match s.get() {
+        Some((v, u)) => {
+            s.set(Some((v + volumes, u + units)));
+            (v, u)
+        }
+        None => (NEXT_VOLUME.fetch_add(volumes, Ordering::Relaxed), NEXT_UNIT.fetch_add(units, Ordering::Relaxed)),
+    })
+}
+
 /// A new volume id; each parse of a `$MFT`, an ext4 volume, a bodyfile or a
 /// USN journal takes one.
 pub fn new_volume() -> u32 {
-    NEXT_VOLUME.fetch_add(1, Ordering::Relaxed)
+    take_ids(1, 0).0
 }
 
 pub fn record(volume: u32, evidence: Evidence) -> Arc<HuntRecord> {
-    Arc::new(HuntRecord { unit: NEXT_UNIT.fetch_add(1, Ordering::Relaxed), volume, evidence })
+    Arc::new(HuntRecord { unit: take_ids(0, 1).1, volume, evidence })
+}
+
+/// Runs `f` with ids numbered from 0, and says how many it took.
+pub fn scoped_ids<T>(f: impl FnOnce() -> T) -> (T, (u32, u64)) {
+    struct Back(Option<(u32, u64)>);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            SCOPE.with(|s| s.set(self.0));
+        }
+    }
+    let back = Back(SCOPE.with(|s| s.replace(Some((0, 0)))));
+    let out = f();
+    let used = SCOPE.with(|s| s.get()).unwrap_or((0, 0));
+    drop(back);
+    (out, used)
+}
+
+/// Reserves the ids an input took in its own scope, where a sequential run
+/// would have given them: right after those of the inputs before it.
+pub fn reserve_ids(volumes: u32, units: u64) -> (u32, u64) {
+    take_ids(volumes, units)
+}
+
+/// Moves the ids of `entries`, numbered from 0 by [`scoped_ids`], by the
+/// bases [`reserve_ids`] gave. Rows of one record keep sharing one record.
+pub fn rebase(entries: &mut [crate::timeline::TimelineEntry], volume_base: u32, unit_base: u64) {
+    if volume_base == 0 && unit_base == 0 {
+        return;
+    }
+    // The old record is kept alive in the map, so its address names it alone.
+    let mut moved: HashMap<*const HuntRecord, (Arc<HuntRecord>, Arc<HuntRecord>)> = HashMap::new();
+    for e in entries {
+        if let Some(h) = e.hunt.take() {
+            let n = moved
+                .entry(Arc::as_ptr(&h))
+                .or_insert_with(|| {
+                    let n = Arc::new(HuntRecord { unit: h.unit + unit_base, volume: h.volume + volume_base, evidence: h.evidence.clone() });
+                    (h.clone(), n)
+                })
+                .1
+                .clone();
+            e.hunt = Some(n);
+        }
+    }
 }
 
 /// An NTFS timestamp; FILETIME 0 is "unset".

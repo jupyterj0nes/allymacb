@@ -192,9 +192,27 @@ fn base_name(file_name: &str) -> String {
     s.to_string()
 }
 
+/// The resident dump goes to a folder the analyst names, new or empty, so the
+/// files in it are those of this run and nothing already there is touched.
+fn resident_destination_ok(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => match entries.next() {
+            None => Ok(()),
+            Some(_) => Err("the folder is not empty; name a new or empty folder for the dump".to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) if dir.is_file() => Err("is a file; name a new or empty folder for the dump".to_string()),
+        Err(e) => Err(format!("cannot be read ({})", e)),
+    }
+}
+
 fn main() -> ExitCode {
     let args = Cli::parse();
     let start_time = Instant::now();
+    let threads = allymacb::par::init(args.threads);
+    // One thread reads the inputs as the code always did, one after another.
+    // The resident dump names files in the order the sources are read.
+    allymacb::par::one_input_at_a_time(threads == 1 || args.resident.is_some());
 
     if !args.quiet {
         print_banner();
@@ -214,6 +232,23 @@ fn main() -> ExitCode {
     }
     if cutoff.is_none() && args.hunt_out.is_some() {
         eprintln!("[!] --hunt-out needs --investigation-from");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    if args.resident_report.is_some() && args.resident.is_none() {
+        eprintln!("[!] --resident-report needs --resident <DIR>");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Some(dir) = &args.resident
+        && let Err(why) = resident_destination_ok(dir)
+    {
+        eprintln!("[!] --resident {}: {}", dir.display(), why);
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Some(rep) = &args.resident_report
+        && rep.exists()
+    {
+        eprintln!("[!] --resident-report {}: the file exists; name a new one", rep.display());
         return ExitCode::from(EXIT_USAGE);
     }
 
@@ -248,6 +283,22 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_NOTHING_PARSED);
         }
     };
+
+    let unfrozen = allymacb::evidence::unfrozen();
+    if unfrozen > 0 {
+        eprintln!(
+            "[!] {} evidence file(s) or folder(s) were read without their access time frozen (read-only medium, another owner, or a reader that opens files itself): the system may have written a new access time on them",
+            unfrozen
+        );
+    }
+
+    let mut resident_report_failed = false;
+    if let (Some(rep), Some(dir)) = (&args.resident_report, &args.resident)
+        && let Err(e) = allymacb::parsers::mft::write_resident_report(rep, dir, &report.resident_stats)
+    {
+        eprintln!("[!] {}", e);
+        resident_report_failed = true;
+    }
 
     if report.sources_ok == 0 {
         eprintln!(
@@ -308,10 +359,11 @@ fn main() -> ExitCode {
             }
         }
         eprintln!("  Elapsed time             : {:.2?}", start_time.elapsed());
+        eprintln!("  Threads                  : {}", threads);
         eprintln!("=================================================");
     }
 
-    if hunt_failed {
+    if hunt_failed || resident_report_failed {
         return ExitCode::from(EXIT_PARTIAL);
     }
 

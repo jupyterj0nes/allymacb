@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-11-09
+
+### Forensically strict: the run neither shows in the timeline nor writes on the evidence
+
+- **Extracted archives** are timelined from the times the archive gives its entries, never from the copy the extraction writes. Before, every folder the extraction made for a file came out with the time of the analysis, and every file carried `rule m_before_b (medium)`, because its modification time (from the archive) was compared with the copy's creation time (now): a false finding made by the tool. Now an entry gives one `m...` row at its archive time, files and directories alike; a folder the archive does not hold has no row; a gzip member with no time (`MTIME` 0) has none instead of the extraction time; and no rule sees a time of the copy.
+- **Folders of the host** (`-d` walks, `-f` of an unrecognised file) are timelined from their metadata as found: every path is stat'ed before the run opens it, a directory before it is listed, and the walk works from that picture. Before, the access time of a file the run had read to recognise it, and of a directory it had listed, came out as the time of the analysis.
+- **Nothing is written on the evidence.** Every file and directory of the evidence is opened with its access time frozen (`src/evidence.rs`): on Windows `SetFileTime` with a last access time of `0xFFFFFFFF_FFFFFFFF` on the handle, which writes nothing and keeps the file system from updating it; on Linux `O_NOATIME`. That covers the parsers, archives, images, the segments of an E01 (now found and opened here, the `ewf` crate reading from them) and the directory listings. Before, running the tool on a folder wrote new access times on what it read, which the next tool, or the next run, then saw. Where the freeze cannot be had (a read-only medium, a file of another owner on Linux, an Ex01, which the `ewf` crate opens itself), the run says how many paths were read the ordinary way.
+- Checked: every time of the 394 files and folders of the corpus is unchanged after running all 53 cases (the binary before: 68 changed); three runs in a row on the same folder give the same CSV; on the whole corpus the only rows that differ from the binary before are `fs` rows, the ones above. `cargo test` checks it on folders, archives, a gzip member, an image, a bodyfile and an archive read by their parsers, and fails when the freeze, the listing freeze or the archive-only times are taken out.
+
+### Every processor, the same bytes
+
+allymacb now uses every logical processor the system reports; `--threads N` sets how many, and `--threads 1` runs the code exactly as before. The output does not depend on it: the CSV, stderr, the exit code, `--hunt-out` and the resident dump are byte for byte the same on any number of threads.
+
+- Inputs are read several at a time: the files given with `-f`, the folders given with `-d`, and every `$MFT`, journal, bodyfile, image and archive found in a folder. Their rows are put together in the order the inputs were given; their messages are kept and printed input by input in that order, as if one followed the other. Progress bars are hidden while several inputs are read: they would draw over each other.
+- The hunt numbers volumes and records as the parsers meet them. Each input numbers its own from zero, and they are moved, in input order, to the numbers a sequential run gives.
+- `--carve`: the free-space search for log lines and `utmp` records, most of the carving time, runs on every thread, a batch of blocks at a time. The scan for `FILE` and `INDX` records, the order hits are taken in, the first copy of a line kept, every count, stay as they were.
+- The timeline is sorted on every thread (a stable sort on the same keys) and its rows are formatted on every thread and written in order.
+- With `-r` the inputs are read one after another: which source gets the plain name of a path shared by two must not depend on which thread is faster.
+- Before, archives found in a folder were already read in parallel, and their messages came out in whatever order the threads finished. They now come out in order too.
+- Checked with `scripts/same_output.py`, which records what one binary writes for every sample and checks that another writes the same bytes on every thread count. On 53 cases (every public and lab sample, a 437,000-record `$MFT`, eight hosts in one folder, archives, partial and failed runs, the resident dump), against the binary before this change: 265 of 265 runs identical on 1, 2, 3, 8 and 12 threads, and 140 of 140 in ten more runs of the heaviest cases on 12. `cargo test` runs every fixture, alone and together, on 1, 2, 3 and 8 threads, and the free-space search with log lines planted across every boundary of small blocks. Each of these tests was seen to fail with a bug planted on purpose (results put together in thread order, messages in the wrong order, the hunt's numbers not moved, hits taken out of order, temporary names from a shared counter).
+- Measured on 12 logical processors, median of three runs: a folder of eight hosts 38.0 s to 21.0 s; `--carve` on images 41 to 50 % less time (E01 3.3 s to 1.7 s); one 437,000-record `$MFT` 17.9 s to 13.4 s. Peak memory on the eight hosts 2.13 GB to 2.28 GB.
+- Temporary files are named after the place of their input in the run, not by a counter the threads share, so the paths printed on stderr are the same on any number of threads.
+
+### The resident dump never overwrites
+
+- Nothing is dumped unless `-r <DIR>` names the folder, and that folder must be new or empty: the files in it are those of the run, and nothing already there is touched.
+- A file is created only if no file has its name, in one step (`create_new`). Two records with the same path, from one `$MFT` or from two hosts in the same run, used to leave only the last one when they also shared the record number (`name.rec<N>` was overwritten); with archives read in parallel two threads could both find a name free. Now the second is `name.rec<N>`, the next `name.rec<N>_2`, and so on.
+- `--resident-report` is written once, with the totals of every source; it used to be rewritten by each `$MFT`, leaving the last one's counts. It needs `--resident` and refuses a file that exists.
 
 ### XFS and LVM
 

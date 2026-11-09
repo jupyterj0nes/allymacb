@@ -9,11 +9,22 @@ pub enum TriageType {
 }
 
 pub fn detect_triage_type(dir: &Path) -> TriageType {
+    let paths: Vec<std::path::PathBuf> = WalkDir::new(dir).max_depth(4).into_iter().filter_map(|e| e.ok()).map(|e| e.into_path()).collect();
+    detect_triage_type_in(dir, &paths)
+}
+
+/// The same, from the paths of the tree already known (a picture taken
+/// before the run read anything): no directory is listed again.
+pub fn detect_triage_type_in(dir: &Path, paths: &[std::path::PathBuf]) -> TriageType {
     let mut has_mft = false;
     let mut has_linux_structures = false;
 
-    for entry_res in WalkDir::new(dir).max_depth(4).into_iter().filter_map(|e| e.ok()) {
-        let fname = entry_res.file_name().to_string_lossy().to_lowercase();
+    for p in paths {
+        let depth = p.strip_prefix(dir).map(|r| r.components().count()).unwrap_or(usize::MAX);
+        if depth > 4 {
+            continue;
+        }
+        let fname = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         if fname == "$mft" || fname == "_mft" || fname.ends_with("$mft") {
             has_mft = true;
             break;

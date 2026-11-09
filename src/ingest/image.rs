@@ -158,7 +158,7 @@ impl SegmentedReader {
             if !candidate.exists() {
                 break;
             }
-            let f = File::open(&candidate)?;
+            let f = crate::evidence::open(&candidate)?;
             let len = f.metadata()?.len();
             starts.push(total);
             total += len;
@@ -484,7 +484,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
         return Err(no_filesystem());
     }
     if !mft_options.quiet {
-        eprintln!("    [i] {} partition(s) with a supported filesystem", partitions.len());
+        crate::say!("    [i] {} partition(s) with a supported filesystem", partitions.len());
     }
 
     // NTFS volumes found, with their live $MFT kept on disk for the carver.
@@ -521,7 +521,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     }
                     Err(e) => {
                         failures += 1;
-                        eprintln!("[!] NTFS partition @0x{:X} in {}: {}", part.offset, label, e);
+                        crate::say!("[!] NTFS partition @0x{:X} in {}: {}", part.offset, label, e);
                         // Still carve the range; parents just cannot be checked against a live table.
                         volumes.push(VolumeContext { start: part.offset, end: u64::MAX, live_mft: None, free_ranges: Vec::new(), free_known: false, hunt_volume: None, label: vol_label.clone() });
                     }
@@ -536,7 +536,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     Ok((mut timeline, rep)) => {
                         super::stamp(&mut timeline, Some(&part_label), Some(&part_label), None);
                         if !mft_options.quiet {
-                            eprintln!("    [+] ext4 @0x{:X}: {}", part.offset, crate::parsers::ext4raw::describe(&rep, mft_options.carve));
+                            crate::say!("    [+] ext4 @0x{:X}: {}", part.offset, crate::parsers::ext4raw::describe(&rep, mft_options.carve));
                         }
                         combined_timeline.extend(timeline);
                         if mft_options.carve {
@@ -550,7 +550,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[!] ext4 @0x{:X}: raw reader failed ({}); falling back to ext4-view (no ctime, no inode numbers, no deleted inodes)", part.offset, e);
+                        crate::say!("[!] ext4 @0x{:X}: raw reader failed ({}); falling back to ext4-view (no ctime, no inode numbers, no deleted inodes)", part.offset, e);
                     }
                 }
                 let reader_arc = Arc::new(Mutex::new(reader));
@@ -561,7 +561,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     }
                     Err(e) => {
                         failures += 1;
-                        eprintln!("[!] ext4 partition @0x{:X} in {}: {}", part.offset, label, e);
+                        crate::say!("[!] ext4 partition @0x{:X} in {}: {}", part.offset, label, e);
                     }
                 }
                 reader = Arc::try_unwrap(reader_arc)
@@ -594,12 +594,12 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     Ok(v) => v,
                     Err(e) => {
                         failures += 1;
-                        eprintln!("[!] LVM partition @0x{:X} in {}: {}", part.offset, label, e);
+                        crate::say!("[!] LVM partition @0x{:X} in {}: {}", part.offset, label, e);
                         Vec::new()
                     }
                 };
                 if part.ptype == PartitionType::Lvm && !mft_options.quiet {
-                    eprintln!("    [i] LVM @0x{:X}: {} logical volume(s)", part.offset, found.len());
+                    crate::say!("    [i] LVM @0x{:X}: {} logical volume(s)", part.offset, found.len());
                 }
                 let mut free_space = None;
                 for v in found {
@@ -607,18 +607,18 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                         Ok((mut timeline, desc)) => {
                             super::stamp(&mut timeline, Some(&v.label), Some(&v.label), None);
                             if !mft_options.quiet {
-                                eprintln!("    [+] {} {}: {}", v.kind, v.label, desc);
+                                crate::say!("    [+] {} {}: {}", v.kind, v.label, desc);
                             }
                             combined_timeline.extend(timeline);
                         }
                         Err(e) if v.kind == "unknown" => {
                             if !mft_options.quiet {
-                                eprintln!("    [i] {}: {}", v.label, e);
+                                crate::say!("    [i] {}: {}", v.label, e);
                             }
                         }
                         Err(e) => {
                             failures += 1;
-                            eprintln!("[!] {} {} in {}: {}", v.kind, v.label, label, e);
+                            crate::say!("[!] {} {} in {}: {}", v.kind, v.label, label, e);
                         }
                     }
                     free_space = free_space.or(v.free);
@@ -644,7 +644,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
             }
         }
         if !mft_options.quiet {
-            eprintln!("    [*] Carving {} for NTFS FILE records and $I30 entries outside the live $MFT...", label);
+            crate::say!("    [*] Carving {} for NTFS FILE records and $I30 entries outside the live $MFT...", label);
         }
         let carved = carve_stream(&mut reader, total_size, &volumes, mft_options, label, &combined_timeline);
         for v in &volumes {
@@ -659,7 +659,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                     e.evidence = e.volume.clone();
                 }
                 if !mft_options.quiet {
-                    eprintln!("    [+] Carving: {} ({} rows)", describe_stats(&stats), entries.len());
+                    crate::say!("    [+] Carving: {} ({} rows)", describe_stats(&stats), entries.len());
                 }
                 if !stats.backdated_records.is_empty() {
                     let backdated: std::collections::HashSet<String> = stats.backdated_records.iter().map(|r| r.to_string()).collect();
@@ -671,7 +671,7 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
             }
             Err(e) => {
                 failures += 1;
-                eprintln!("[!] Carving {}: {}", label, e);
+                crate::say!("[!] Carving {}: {}", label, e);
             }
         }
         if combined_timeline.is_empty() && volumes.is_empty() {
@@ -690,6 +690,36 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
     Ok((combined_timeline, total_stats))
 }
 
+/// The segments of an EWF v1 image (`name.E01`, `.E02` ... `.E99`, `.EAA`
+/// ...), found and ordered as the `ewf` crate finds them, opened through
+/// [`crate::evidence::open`]. `None` when they cannot be (the crate then
+/// opens them itself).
+fn ewf_v1_segments(first: &Path) -> Option<Vec<ewf::SegmentSource>> {
+    let stem = first.file_stem()?.to_str()?;
+    let parent = match first.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let prefix = first.extension()?.to_str()?.chars().next()?.to_ascii_uppercase();
+    let mut segs: Vec<PathBuf> = crate::evidence::list_dir(parent)
+        .ok()?
+        .into_iter()
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { return false };
+            let Some(ext) = name.strip_prefix(stem).and_then(|r| r.strip_prefix('.')) else { return false };
+            let c: Vec<char> = ext.chars().collect();
+            c.len() == 3
+                && c[0].to_ascii_uppercase() == prefix
+                && ((c[1].is_ascii_digit() && c[2].is_ascii_digit()) || (c[1].is_ascii_alphabetic() && c[2].is_ascii_alphabetic()))
+        })
+        .collect();
+    if segs.is_empty() {
+        return None;
+    }
+    segs.sort_by_key(|p| p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_uppercase());
+    segs.iter().map(|p| crate::evidence::open(p).ok().map(ewf::SegmentSource::File)).collect()
+}
+
 pub fn parse_forensic_image(
     image_path: &Path,
     mft_options: &MftParseOptions,
@@ -703,7 +733,17 @@ pub fn parse_forensic_image(
     let label = image_path.display().to_string();
 
     if ext == "e01" || ext == "ex01" {
-        let ewf_reader = ewf::EwfReader::open(&label).map_err(|e| AllyError::Image {
+        // Segments found and opened here, their access time frozen (see
+        // `crate::evidence`); the crate's own opening is the fallback, for
+        // EWF2 (Ex01), which it reads only from paths.
+        let ewf_reader = match (ext == "e01").then(|| ewf_v1_segments(image_path)).flatten() {
+            Some(sources) => ewf::EwfReader::open_from_sources(sources),
+            None => {
+                crate::evidence::note_unfrozen(1);
+                ewf::EwfReader::open(&label)
+            }
+        }
+        .map_err(|e| AllyError::Image {
             code: ErrorCode::ImageReadFailed,
             path: label.clone(),
             message: format!("Failed opening E01 image: {}", e),
@@ -717,7 +757,7 @@ pub fn parse_forensic_image(
     if ext.chars().all(|c| c.is_ascii_digit()) && !ext.is_empty() {
         let seg = SegmentedReader::open(image_path).map_err(|e| AllyError::io_with_context(e, format!("Opening split raw image {}", label)))?;
         if !mft_options.quiet && seg.segment_count() > 1 {
-            eprintln!("    [i] Split raw image: {} segments, {} bytes", seg.segment_count(), seg.total_size());
+            crate::say!("    [i] Split raw image: {} segments, {} bytes", seg.segment_count(), seg.total_size());
         }
         let total = seg.total_size();
         let mut reader = BufReader::new(seg);
@@ -727,7 +767,7 @@ pub fn parse_forensic_image(
         return parse_partitions(reader, total, &label, mft_options, temp_dir);
     }
 
-    let file = File::open(image_path).map_err(|e| AllyError::io_with_context(e, format!("Opening raw disk image {}", label)))?;
+    let file = crate::evidence::open(image_path).map_err(|e| AllyError::io_with_context(e, format!("Opening raw disk image {}", label)))?;
     let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
     if let Some(fmt) = detect_container_format(&mut reader) {

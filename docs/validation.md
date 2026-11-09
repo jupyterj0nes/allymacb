@@ -46,10 +46,31 @@ python scripts/check_hunt.py truth.json hunt.csv
 | An 8 MiB ext4 volume with a journal, built the same way and shipped gzipped in `tests/data` | What was done to it | Run by `cargo test`: inode numbers and ctime on live rows; a deleted file named through the journal; the pre-growth size of an appended file; the old name of a renamed file; a deleted directory tree with its paths; `backdated` on a file whose mtime was moved to 1975 after the journal saw it in 2026. |
 | faramir's Linux disk fixtures, built on a real host by its `scripts/linux_disk_lab.sh` and shipped gzipped in `tests/data`: a 64 MiB GPT image with one XFS partition, an 80 MiB MBR image with an LVM physical volume holding an XFS logical volume, a 48 MiB one holding ext4; each with a small root and three files created and removed again | What the script wrote | Run by `cargo test`: every path of the root, `crtime` and nanoseconds on XFS v5, `/lib` as a symlink, the root at the superblock's inode 128, `p1:vg_xfs/root` in `volume` and `evidence`; on the LVM XFS the four freed inodes, with a last change at the very nanosecond `/etc/cron.d` changed; on the LVM ext4 the removed `/etc/cron.d/gone`, `gone.service` and `authorized_keys2` named by the journal read through the logical volume. Their names are not in XFS directory slack: those directories are short-form, compacted on removal. |
 
+## Same output on any number of threads
+
+allymacb uses every logical processor by default (`--threads N` to set it, `--threads 1` to run the code as it always ran). The claim is that the output does not change, byte for byte: CSV, stderr, exit code, `--hunt-out`, the resident dump and its report.
+
+```bash
+python scripts/same_output.py record --bin old/allymacb --samples samples/ --out ref.json
+python scripts/same_output.py check  --bin target/release/allymacb --samples samples/ --ref ref.json --threads 1,2,3,8,12
+```
+
+| Run | Cases | Result |
+|---|---|---|
+| The binary before multithreading, twice | 53: every sample above, a 437,000-record `$MFT` three ways, eight hosts in one folder (two large `$MFT`s, XP `$MFT`s, ext4, VHD, E01, an archive) carved and hunted, `-f` lists in two orders, two folders at once, archives, the resident dump of four sources, a missing file, a truncated E01, random bytes | Itself: identical, except rows a directory walk writes while it reads (the access time it just set, folders an archive is extracted into), which are left out of every comparison, and the order of messages from archives found in a folder, which the old binary printed as its threads finished |
+| The new binary on 1, 2, 3, 8 and 12 threads | The same 53 | **265 of 265 identical** to the old binary; the old archive messages compared as a set of lines, and the new ones exactly between thread counts |
+| The new binary, ten times on 12 threads | The 14 cases with the most inputs at once | **140 of 140 identical** |
+
+## The run leaves no trace
+
+Every time (access, modification, change) of the 394 files and folders the 53 cases above read was taken before the runs and again after: **0 changed** (the binary before freezing access times: 68). Three runs in a row on the same folder give the same CSV, and no row of any case carries a time of the run itself. `cargo test` repeats this on folders, archives, gzip members, an image and a bodyfile aged to 2001, so any access the system would record shows.
+
+`cargo test` repeats the check on the fixtures of `tests/data` (alone, together with archives and a missing file, in a folder, hunted, the resident dump of three sources), and on the free-space search with 156 log lines planted across every block, tail and carry boundary of 128 KiB blocks, batches of 1 to 24 blocks on 1 to 12 threads. Each test was seen to fail with a bug planted on purpose.
+
 ## Tests
 
 ```bash
 cargo test
 ```
 
-593 tests: parsers, anti-forensics indicators and their place in the shared tail, the volume's word on them (the installation window, the hour against the measured clean hours, a never-seen pattern never folded, the journal taking its `$MFT`'s window), the statistical hunt (stomped records against a baseline of ordinary copies, a calibration window with none, the journal and allocation-order checks, the score scale, the CLI), the 19-column layout and how `evidence` is built from nested inputs, the raw ext4 reader on a real journaled volume, log and utmp carving, MACB flag combinations, timestamp boundaries, permission matrices, synthetic `$MFT` records (parent cycles, stale sequence numbers, non-resident sizes, ADS, path traversal, deleted/live collisions, damaged first records), carving (records at odd sector offsets, across the read block boundary, duplicates and older states, dedup against a live `$MFT`, `$I30` slack, decoys, the flag being opt-in), and end-to-end runs of the binary that check stdout stays pure CSV and exit codes reflect partial or total failure.
+619 tests: parsers, anti-forensics indicators and their place in the shared tail, the volume's word on them (the installation window, the hour against the measured clean hours, a never-seen pattern never folded, the journal taking its `$MFT`'s window), the statistical hunt (stomped records against a baseline of ordinary copies, a calibration window with none, the journal and allocation-order checks, the score scale, the CLI), the 19-column layout and how `evidence` is built from nested inputs, the raw ext4 reader on a real journaled volume, log and utmp carving, MACB flag combinations, timestamp boundaries, permission matrices, synthetic `$MFT` records (parent cycles, stale sequence numbers, non-resident sizes, ADS, path traversal, deleted/live collisions, damaged first records), carving (records at odd sector offsets, across the read block boundary, duplicates and older states, dedup against a live `$MFT`, `$I30` slack, decoys, the flag being opt-in), the same output on 1, 2, 3 and 8 threads, evidence read without a trace and archives timelined from their own times, the resident dump never overwriting a file, and end-to-end runs of the binary that check stdout stays pure CSV and exit codes reflect partial or total failure.

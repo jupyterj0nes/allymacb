@@ -1,7 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
@@ -16,13 +15,11 @@ use crate::timeline::TimelineEntry;
 
 use super::{is_bodyfile_name, is_mft_name, is_usn_name, looks_like_bodyfile};
 
-/// Process-wide counter so parallel workers never share a staging file name.
-static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Unique staging path inside `dir` for an extracted artifact.
 pub fn staging_path(dir: &Path, prefix: &str, ext: &str) -> PathBuf {
-    let n = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!("{}_{}_{}.{}", prefix, std::process::id(), n, ext))
+    // The workspace is the run's own; the name says where in the run, so it
+    // is the same on any number of threads (see `par::unique_name`).
+    dir.join(format!("{}_{}.{}", prefix, crate::par::unique_name(), ext))
 }
 
 /// Outcome of extracting an archive to disk.
@@ -33,6 +30,37 @@ pub struct ExtractReport {
     pub unsafe_entries: usize,
     /// Entries that failed to extract for I/O or decompression reasons.
     pub failed_entries: usize,
+    /// Every entry written, files and directories, with the modification
+    /// time the archive gives it (`None` when it gives none). The timeline
+    /// of an extracted archive is made of these times only: whatever the
+    /// extraction itself writes on disk (folders made for a file, the copy's
+    /// own creation time) is the analyst's machine, not evidence.
+    pub members: Vec<ArchiveMember>,
+}
+
+/// One entry of an archive as extracted.
+#[derive(Debug, Clone)]
+pub struct ArchiveMember {
+    /// Where it was written, built component by component under the target.
+    pub path: PathBuf,
+    pub mtime: Option<(i64, u32)>,
+}
+
+/// `target` + the normal components of `rel`, the separators of the host.
+fn under(target: &Path, rel: &Path) -> PathBuf {
+    let mut p = target.to_path_buf();
+    for c in rel.components() {
+        if let std::path::Component::Normal(x) = c {
+            p.push(x);
+        }
+    }
+    p
+}
+
+/// A ZIP time: DOS fields with no zone, read as UTC.
+fn zip_mtime(dt: zip::DateTime) -> Option<(i64, u32)> {
+    let date = chrono::NaiveDate::from_ymd_opt(dt.year() as i32, dt.month() as u32, dt.day() as u32)?;
+    Some((date.and_hms_opt(dt.hour() as u32, dt.minute() as u32, dt.second() as u32)?.and_utc().timestamp(), 0))
 }
 
 fn zip_mtime_to_system_time(dt: zip::DateTime) -> Option<std::time::SystemTime> {
@@ -73,6 +101,7 @@ fn extract_tar<R: Read>(
                 continue;
             }
         };
+        let mtime = entry.header().mtime().ok().and_then(|t| i64::try_from(t).ok()).map(|t| (t, 0));
         entry.set_preserve_mtime(true);
         entry.set_unpack_xattrs(false);
         entry.set_preserve_permissions(false);
@@ -80,6 +109,7 @@ fn extract_tar<R: Read>(
         // (`..` components, absolute paths, symlink escapes).
         match entry.unpack_in(target_dir) {
             Ok(true) => {
+                report.members.push(ArchiveMember { path: under(target_dir, &rel), mtime });
                 if !entry.header().entry_type().is_dir() {
                     report.files.push(target_dir.join(rel));
                 }
@@ -94,7 +124,7 @@ fn extract_tar<R: Read>(
 pub fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<Vec<PathBuf>> {
     let report = extract_archive_with_report(archive_path, target_dir)?;
     if report.unsafe_entries > 0 {
-        eprintln!(
+        crate::say!(
             "[!] {}: {} entries refused because their path escaped the extraction directory",
             archive_path.display(),
             report.unsafe_entries
@@ -109,7 +139,7 @@ pub fn extract_archive_with_report(archive_path: &Path, target_dir: &Path) -> Re
     let fname_lower = fname.to_lowercase();
 
     if fname_lower.ends_with(".zip") {
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening zip archive {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening zip archive {}", archive_path.display())))?;
         let mut zip = ZipArchive::new(BufReader::new(file)).map_err(|e| AllyError::Archive {
             code: ErrorCode::ArchiveCorrupt,
             path: archive_path.display().to_string(),
@@ -134,10 +164,13 @@ pub fn extract_archive_with_report(archive_path: &Path, target_dir: &Path) -> Re
                 }
             };
             let mtime = file.last_modified().and_then(zip_mtime_to_system_time);
+            let member_time = file.last_modified().and_then(zip_mtime);
 
             let out_path = target_dir.join(&enclosed_name);
             if is_dir {
-                let _ = fs::create_dir_all(&out_path);
+                if fs::create_dir_all(&out_path).is_ok() {
+                    report.members.push(ArchiveMember { path: under(target_dir, &enclosed_name), mtime: member_time });
+                }
             } else {
                 if let Some(p) = out_path.parent() {
                     let _ = fs::create_dir_all(p);
@@ -151,6 +184,7 @@ pub fn extract_archive_with_report(archive_path: &Path, target_dir: &Path) -> Re
                         if let Some(t) = mtime {
                             let _ = outfile.set_modified(t);
                         }
+                        report.members.push(ArchiveMember { path: under(target_dir, &enclosed_name), mtime: member_time });
                         report.files.push(out_path);
                     }
                     Err(_) => report.failed_entries += 1,
@@ -158,17 +192,17 @@ pub fn extract_archive_with_report(archive_path: &Path, target_dir: &Path) -> Re
             }
         }
     } else if fname_lower.ends_with(".tar.gz") || fname_lower.ends_with(".tgz") {
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar.gz archive {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar.gz archive {}", archive_path.display())))?;
         let gz = GzDecoder::new(BufReader::new(file));
         let mut tar = TarArchive::new(gz);
         extract_tar(&mut tar, archive_path, target_dir, &mut report)?;
     } else if fname_lower.ends_with(".tar") {
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar archive {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar archive {}", archive_path.display())))?;
         let mut tar = TarArchive::new(BufReader::new(file));
         extract_tar(&mut tar, archive_path, target_dir, &mut report)?;
     } else if fname_lower.ends_with(".gz") {
         // Single gzip member (not a tarball): decompress to one file.
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening gzip file {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening gzip file {}", archive_path.display())))?;
         let mut gz = GzDecoder::new(BufReader::new(file));
         let inner_name = fname.strip_suffix(".gz").unwrap_or("member");
         let out_path = target_dir.join(inner_name);
@@ -181,6 +215,9 @@ pub fn extract_archive_with_report(archive_path: &Path, target_dir: &Path) -> Re
             path: archive_path.display().to_string(),
             message: format!("gzip decompression failed: {}", e),
         })?;
+        // RFC 1952: MTIME 0 means no time is given.
+        let mtime = gz.header().map(|h| h.mtime()).filter(|&t| t != 0).map(|t| (t as i64, 0));
+        report.members.push(ArchiveMember { path: out_path.clone(), mtime });
         report.files.push(out_path);
     } else {
         return Err(AllyError::Archive {
@@ -219,7 +256,7 @@ impl FastResult {
 
 fn log(quiet: bool, msg: String) {
     if !quiet {
-        eprintln!("{}", msg);
+        crate::say!("{}", msg);
     }
 }
 
@@ -326,7 +363,7 @@ fn scan_tar<R: Read>(
             let inner_gz: Box<dyn Read + '_> = Box::new(GzDecoder::new(&mut entry));
             let mut inner_tar = TarArchive::new(inner_gz);
             if let Err(e) = scan_tar(&mut inner_tar, container_name, mft_options, staging_dir, acc, depth + 1) {
-                eprintln!("[!] Nested archive {} inside {}: {}", entry_path, container_name, e);
+                crate::say!("[!] Nested archive {} inside {}: {}", entry_path, container_name, e);
             }
         } else if depth == 0 && lower.ends_with(".zip") {
             // Nested zip needs random access: stage it first.
@@ -335,7 +372,7 @@ fn scan_tar<R: Read>(
                 if io::copy(&mut entry, &mut f).is_ok() {
                     drop(f);
                     if let Err(e) = scan_zip_file(&staged, container_name, mft_options, staging_dir, acc) {
-                        eprintln!("[!] Nested archive {} inside {}: {}", entry_path, container_name, e);
+                        crate::say!("[!] Nested archive {} inside {}: {}", entry_path, container_name, e);
                     }
                 }
             }
@@ -352,7 +389,7 @@ fn scan_zip_file(
     staging_dir: &Path,
     acc: &mut FastResult,
 ) -> Result<()> {
-    let file = File::open(zip_path).map_err(|e| AllyError::io_with_context(e, format!("Opening zip {}", zip_path.display())))?;
+    let file = crate::evidence::open(zip_path).map_err(|e| AllyError::io_with_context(e, format!("Opening zip {}", zip_path.display())))?;
     let mut zip = ZipArchive::new(BufReader::new(file)).map_err(|e| AllyError::Archive {
         code: ErrorCode::ArchiveCorrupt,
         path: zip_path.display().to_string(),
@@ -398,19 +435,19 @@ pub fn process_archive_fast(
     let mut acc = FastResult::new();
 
     if fname_lower.ends_with(".tar.gz") || fname_lower.ends_with(".tgz") {
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar.gz {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar.gz {}", archive_path.display())))?;
         let gz = GzDecoder::new(BufReader::new(file));
         let mut tar = TarArchive::new(gz);
         scan_tar(&mut tar, container_name, mft_options, staging_dir, &mut acc, 0)?;
     } else if fname_lower.ends_with(".tar") {
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening tar {}", archive_path.display())))?;
         let mut tar = TarArchive::new(BufReader::new(file));
         scan_tar(&mut tar, container_name, mft_options, staging_dir, &mut acc, 0)?;
     } else if fname_lower.ends_with(".zip") {
         scan_zip_file(archive_path, container_name, mft_options, staging_dir, &mut acc)?;
     } else if fname_lower.ends_with(".gz") {
         // Plain gzip member: a compressed bodyfile is the common case.
-        let file = File::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening gzip {}", archive_path.display())))?;
+        let file = crate::evidence::open(archive_path).map_err(|e| AllyError::io_with_context(e, format!("Opening gzip {}", archive_path.display())))?;
         let mut gz = BufReader::new(GzDecoder::new(BufReader::new(file)));
         let inner = fname.strip_suffix(".gz").unwrap_or("").to_lowercase();
         let first_line = {

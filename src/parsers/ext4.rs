@@ -128,7 +128,7 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
 ) -> Result<Vec<TimelineEntry>> {
     let (timeline, report) = parse_ext4_partition_with_report(reader, partition_offset)?;
     if report.metadata_failed > 0 || report.dirs_failed > 0 || report.depth_limited > 0 {
-        eprintln!(
+        crate::say!(
             "[!] ext4 @0x{:X}: {} entries timelined, {} inodes unreadable, {} directories unreadable, {} subtrees cut at depth {}",
             partition_offset,
             report.entries_ok,
@@ -138,7 +138,7 @@ pub fn parse_ext4_partition<R: Read + Seek + Send + 'static>(
             MAX_DIR_DEPTH
         );
         for msg in &report.sample_errors {
-            eprintln!("    {}", msg);
+            crate::say!("    {}", msg);
         }
     }
     Ok(timeline)

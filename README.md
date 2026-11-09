@@ -9,7 +9,7 @@
   <a href="https://github.com/jupyterj0nes/allymacb/releases/latest"><img src="https://img.shields.io/github/v/release/jupyterj0nes/allymacb?label=release" alt="Release"></a>
   <a href="https://github.com/jupyterj0nes/allymacb/releases/latest"><img src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-stable-orange?logo=rust" alt="Rust"></a>
-  <a href="docs/validation.md"><img src="https://img.shields.io/badge/tests-599%20passing-brightgreen" alt="Tests"></a>
+  <a href="docs/validation.md"><img src="https://img.shields.io/badge/tests-619%20passing-brightgreen" alt="Tests"></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPLv3-blue.svg" alt="License: AGPL v3"></a>
 
 </div>
@@ -117,8 +117,9 @@ Usage: allymacb [OPTIONS]
   -o, --output <OUTPUT>        CSV path. Without it the CSV goes to stdout.
   -m, --drive <DRIVE>          Drive letter for NTFS paths [default: C].
   -n, --file-name              Also emit $FILE_NAME (0x30) timestamps.
-  -r, --resident <DIR>         Dump resident $DATA streams under this directory.
-      --resident-report <FILE> Summary of the resident dump.
+  -r, --resident <DIR>         Dump resident $DATA streams into this folder, new or empty.
+                               Off unless given; no file is ever overwritten.
+      --resident-report <FILE> Summary of the resident dump of the whole run.
   -q, --quiet                  No banner, progress bars or informational lines. Warnings stay.
       --carve                  Also scan images and unrecognised files sector by sector for
                                NTFS records outside the live $MFT. Off by default.
@@ -128,6 +129,8 @@ Usage: allymacb [OPTIONS]
       --alpha <RATE>           False discovery rate of the hunt [default: 0.05].
       --hunt-out <CSV>         Findings table of the hunt (19 columns, laid out like masstin's):
                                every irregular record of the window, with p, q and the reasons.
+      --threads <N>            Threads to use [default: 0, every logical processor].
+                               The output is byte for byte the same with any number.
   -h, --help / -V, --version
 ```
 
@@ -142,6 +145,8 @@ Every number in this README was measured. The details are in [How it was checked
   - Lab NTFS volumes with a known truth: every deleted path is recovered, and every reused MFT record has its previous owner named (19/19, 150/150, 492/492). A quick-formatted volume gives back all 87 original files.
   - A lab ext4 volume: all 45 deleted files come back with their path, and 8,128 of 8,128 log records are recovered from free space.
 - **Clean hosts.** On three clean machines (a Windows Server 2016, a domain controller from the same image and an Ubuntu 22.04 server), the rules raise 0 `significant` and 0 `candidate`.
+- **No trace.** Reading the evidence writes nothing on it: after all 53 validation cases, every time of the 394 files and folders they read is unchanged. No row carries a time of the analysis itself.
+- **Same output on every processor.** On 53 cases, 265 of 265 runs on 1 to 12 threads are byte for byte those of the single-threaded binary. Eight hosts in one folder take 21 s instead of 38 s; carving takes about half the time.
 - **Planted timestomps.** On the NIST `$MFT`, 14 of 20 are found with no false positive. On the clean Server 2016, the rules alone find the 5 they can see with a precision of 1.00, and the hunt finds 15 of 20.
 
 ## Limitations
@@ -164,6 +169,7 @@ Every number in this README was measured. The details are in [How it was checked
 | [Statistical hunt](docs/hunt.md) | How `--investigation-from` tests a record, the score scale, the findings table, where the numbers stop |
 | [Carving](docs/carving.md) | `FILE` and `$I30` carving and deduplication against the live `$MFT`, the ext4 journal, XFS directory slack, logs and `utmp` in free space |
 | [How it was checked](docs/validation.md) | Every comparison against independent tools and lab volumes with a known truth, and the test suite |
+| [Roadmap](docs/roadmap.md) | What could come next and why it is not done yet: speed on a single machine, inputs read at once, reading without a trace |
 | [CHANGELOG](CHANGELOG.md) | What changed, release by release |
 
 ## Credits and license

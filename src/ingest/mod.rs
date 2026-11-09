@@ -15,13 +15,13 @@ use walkdir::WalkDir;
 
 use crate::error::{AllyError, ErrorCode, Result};
 use crate::parsers::bodyfile::parse_bodyfile_stream;
-use crate::parsers::fs_walk::{walk_directory_timeline, walk_directory_timeline_with, WalkOptions};
+use crate::parsers::fs_walk::{timeline_from_archive, timeline_from_snapshot, TreeSnapshot, WalkOptions};
 use crate::parsers::mft::{parse_mft_file, MftParseOptions, ResidentStats};
 use crate::parsers::usn::{parse_usn_file, UsnParseOptions};
 use crate::timeline::TimelineEntry;
 use archive::{extract_archive_with_report, process_archive_fast};
 use image::parse_forensic_image;
-use triage::{detect_triage_type, TriageType};
+use triage::TriageType;
 
 static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -127,15 +127,33 @@ impl IngestReport {
         self.sources_ok += 1;
     }
 
+    /// Adds what one input gave, read on its own (its messages already said).
+    fn absorb(&mut self, part: IngestReport) {
+        self.timeline.extend(part.timeline);
+        self.resident_stats.total_extracted += part.resident_stats.total_extracted;
+        self.resident_stats.total_bytes += part.resident_stats.total_bytes;
+        self.resident_stats.total_failed += part.resident_stats.total_failed;
+        self.resident_stats.total_unsafe_paths += part.resident_stats.total_unsafe_paths;
+        self.sources_ok += part.sources_ok;
+        self.sources_failed += part.sources_failed;
+        self.warnings.extend(part.warnings);
+    }
+
     fn fail(&mut self, msg: String) {
-        eprintln!("[!] {}", msg);
+        crate::say!("[!] {}", msg);
         self.warnings.push(msg);
         self.sources_failed += 1;
     }
 
     fn warn(&mut self, msg: String) {
-        eprintln!("[!] {}", msg);
+        crate::say!("[!] {}", msg);
         self.warnings.push(msg);
+    }
+}
+
+impl crate::par::Rebase for IngestReport {
+    fn rebase(&mut self, v: u32, u: u64) {
+        crate::hunt::rebase(&mut self.timeline, v, u);
     }
 }
 
@@ -179,7 +197,7 @@ fn drive(mft_options: &MftParseOptions) -> String {
 
 fn info(quiet: bool, msg: String) {
     if !quiet {
-        eprintln!("{}", msg);
+        crate::say!("{}", msg);
     }
 }
 
@@ -192,7 +210,7 @@ fn usn_options(mft_options: &MftParseOptions) -> UsnParseOptions {
 }
 
 fn parse_bodyfile_path(path: &Path) -> Result<Vec<TimelineEntry>> {
-    let f = fs::File::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening bodyfile {}", path.display())))?;
+    let f = crate::evidence::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening bodyfile {}", path.display())))?;
     // The stem names the host (`server01.body`); `bodyfile.txt` names nothing.
     let prefix = path
         .file_stem()
@@ -211,7 +229,7 @@ fn timeline_extracted_archive(
     workspace: &EvidenceWorkspace,
     report: &mut IngestReport,
 ) {
-    let extract_target = workspace.temp_dir().join(format!("arch_{}", WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    let extract_target = workspace.temp_dir().join(format!("arch_{}", crate::par::unique_name()));
     if let Err(e) = fs::create_dir_all(&extract_target) {
         report.fail(format!("{}: cannot create extraction dir: {}", file_path.display(), e));
         return;
@@ -241,7 +259,7 @@ fn timeline_extracted_archive(
     ));
 
     // The extracted tree may itself contain MFTs/images/archives (nested evidence).
-    let (mut entries, stats) = process_directory_internal(&extract_target, mft_options, workspace.temp_dir(), report, true);
+    let (mut entries, stats) = process_directory_internal(&extract_target, mft_options, workspace.temp_dir(), report, Source::Archive(&extracted.members));
     let target_prefix = extract_target.to_string_lossy().to_string();
     for entry in &mut entries {
         if entry.file_name.starts_with(&target_prefix) {
@@ -259,44 +277,62 @@ pub fn process_evidence_inputs(
     mft_options: &MftParseOptions,
 ) -> Result<IngestReport> {
     let workspace = EvidenceWorkspace::new()?;
+
+    // The host metadata of every input, before anything of the run reads it:
+    // the times a walk reports are those found, not those the run leaves.
+    // A directory given with -f is not walked: no picture of it.
+    let file_snaps: Vec<TreeSnapshot> = files.iter().map(|f| if f.is_dir() { TreeSnapshot::default() } else { TreeSnapshot::take(f) }).collect();
+    let dir_snaps: Vec<TreeSnapshot> = directories.iter().map(|d| TreeSnapshot::take(d)).collect();
+    let file_items: Vec<(&PathBuf, &TreeSnapshot)> = files.iter().zip(file_snaps.iter()).collect();
+    let dir_items: Vec<(&PathBuf, &TreeSnapshot)> = directories.iter().zip(dir_snaps.iter()).collect();
     let mut report = IngestReport::default();
     let quiet = mft_options.quiet;
 
-    // 1. Process explicit individual files
-    for file_path in files {
-        if !file_path.exists() {
-            report.fail(format!("File not found: {}", file_path.display()));
-            continue;
-        }
-        let before = report.timeline.len();
-        process_file(file_path, mft_options, &workspace, &mut report);
-        let name = input_name(file_path);
-        stamp(&mut report.timeline[before..], Some(&name), None, None);
-    }
+    // 1. Process explicit individual files: several at a time, put together
+    // in the order given.
+    crate::par::ordered(
+        &file_items,
+        |&(file_path, snap)| {
+            let mut part = IngestReport::default();
+            if !file_path.exists() {
+                part.fail(format!("File not found: {}", file_path.display()));
+                return part;
+            }
+            process_file(file_path, snap, mft_options, &workspace, &mut part);
+            let name = input_name(file_path);
+            stamp(&mut part.timeline, Some(&name), None, None);
+            part
+        },
+        |part| report.absorb(part),
+    );
 
 
     // 2. Process specified directories / triages
-    for dir_path in directories {
-        if !dir_path.exists() {
-            report.fail(format!("Directory not found: {}", dir_path.display()));
-            continue;
-        }
+    crate::par::ordered(
+        &dir_items,
+        |&(dir_path, snap)| {
+            let mut part = IngestReport::default();
+            if !dir_path.exists() {
+                part.fail(format!("Directory not found: {}", dir_path.display()));
+                return part;
+            }
 
-        info(quiet, format!("[*] Scanning evidence directory: {}", dir_path.display()));
-        let before_ok = report.sources_ok;
-        let before_failed = report.sources_failed;
-        let (mut entries, stats) = process_directory_internal(dir_path, mft_options, workspace.temp_dir(), &mut report, false);
-        stamp(&mut entries, Some(&input_name(dir_path)), None, None);
-        if report.sources_ok == before_ok && report.sources_failed == before_failed && entries.is_empty() {
-            report.fail(format!("{}: no evidence found", dir_path.display()));
-        } else {
-            report.timeline.extend(entries);
-            report.resident_stats.total_extracted += stats.total_extracted;
-            report.resident_stats.total_bytes += stats.total_bytes;
-            report.resident_stats.total_failed += stats.total_failed;
-            report.resident_stats.total_unsafe_paths += stats.total_unsafe_paths;
-        }
-    }
+            info(quiet, format!("[*] Scanning evidence directory: {}", dir_path.display()));
+            let (mut entries, stats) = process_directory_internal(dir_path, mft_options, workspace.temp_dir(), &mut part, Source::Host(snap));
+            stamp(&mut entries, Some(&input_name(dir_path)), None, None);
+            if part.sources_ok == 0 && part.sources_failed == 0 && entries.is_empty() {
+                part.fail(format!("{}: no evidence found", dir_path.display()));
+            } else {
+                part.timeline.extend(entries);
+                part.resident_stats.total_extracted += stats.total_extracted;
+                part.resident_stats.total_bytes += stats.total_bytes;
+                part.resident_stats.total_failed += stats.total_failed;
+                part.resident_stats.total_unsafe_paths += stats.total_unsafe_paths;
+            }
+            part
+        },
+        |part| report.absorb(part),
+    );
 
     // 3. Process standalone USN Journal file if supplied via CLI
     if let Some(usn_path) = usn_file {
@@ -318,7 +354,7 @@ pub fn process_evidence_inputs(
 }
 
 /// Parses one input given with `-f`, by name, extension or content.
-fn process_file(file_path: &Path, mft_options: &MftParseOptions, workspace: &EvidenceWorkspace, report: &mut IngestReport) {
+fn process_file(file_path: &Path, snap: &TreeSnapshot, mft_options: &MftParseOptions, workspace: &EvidenceWorkspace, report: &mut IngestReport) {
     let quiet = mft_options.quiet;
     let before = report.timeline.len();
     let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -406,10 +442,7 @@ fn process_file(file_path: &Path, mft_options: &MftParseOptions, workspace: &Evi
                     "{}: unrecognized evidence type; timelining the host filesystem metadata of this file only (use --carve to scan it for NTFS records)",
                     file_path.display()
                 ));
-                match walk_directory_timeline(file_path) {
-                    Ok(entries) => report.ok(entries, ResidentStats::default()),
-                    Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
-                }
+                report.ok(timeline_from_snapshot(snap, file_path, &WalkOptions::default()), ResidentStats::default());
             }
             Err(e) => report.fail(format!("{}: cannot read: {}", file_path.display(), e)),
         }
@@ -437,13 +470,20 @@ fn process_directory_internal(
     mft_options: &MftParseOptions,
     temp_dir: &Path,
     report: &mut IngestReport,
-    from_archive: bool,
+    source: Source<'_>,
 ) -> (Vec<TimelineEntry>, ResidentStats) {
+    let from_archive = matches!(source, Source::Archive(_));
     let quiet = mft_options.quiet;
     let mut combined_timeline = Vec::new();
     let mut total_resident_stats = ResidentStats::default();
 
-    let triage_type = detect_triage_type(dir_path);
+    // The tree as the picture taken before the run saw it, or, for a folder
+    // the run extracted an archive into, as it is: its own copy.
+    let tree: Vec<PathBuf> = match source {
+        Source::Host(snap) => snap.paths(),
+        Source::Archive(_) => WalkDir::new(dir_path).follow_links(false).into_iter().filter_map(|e| e.ok()).map(|e| e.into_path()).collect(),
+    };
+    let triage_type = triage::detect_triage_type_in(dir_path, &tree);
 
     let mut mft_files = Vec::new();
     let mut usn_files = Vec::new();
@@ -451,8 +491,8 @@ fn process_directory_internal(
     let mut image_files = Vec::new();
     let mut archive_files = Vec::new();
 
-    for entry_res in WalkDir::new(dir_path).follow_links(false).into_iter().filter_map(|e| e.ok()) {
-        let p = entry_res.path();
+    for p in &tree {
+        let p = p.as_path();
         if !p.is_file() {
             continue;
         }
@@ -493,59 +533,89 @@ fn process_directory_internal(
         report.sources_ok += 1;
     }
 
-    for mft_p in &mft_files {
-        info(quiet, format!("[*] Found MFT in triage: {}", mft_p.display()));
-        match parse_mft_file(mft_p, mft_options) {
-            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(mft_p)), mft_options),
-            Err(e) => report.fail(format!("{}: {}", mft_p.display(), e)),
-        }
+    // Every artifact found is read on its own, several at a time, and put
+    // together in the order a sequential run reads them: $MFTs, journals,
+    // bodyfiles, images, archives.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Mft,
+        Usn,
+        Body,
+        Image,
+        Archive,
     }
+    let mut jobs: Vec<(Kind, &PathBuf)> = Vec::new();
+    jobs.extend(mft_files.iter().map(|p| (Kind::Mft, p)));
+    jobs.extend(usn_files.iter().map(|p| (Kind::Usn, p)));
+    jobs.extend(body_files.iter().map(|p| (Kind::Body, p)));
+    jobs.extend(image_files.iter().map(|p| (Kind::Image, p)));
+    jobs.extend(archive_files.iter().map(|p| (Kind::Archive, p)));
+    let first_archive = jobs.iter().position(|j| j.0 == Kind::Archive);
+    let jobs: Vec<(usize, Kind, &PathBuf)> = jobs.into_iter().enumerate().map(|(i, (k, p))| (i, k, p)).collect();
 
-    for usn_p in &usn_files {
-        info(quiet, format!("[*] Found USN journal in triage: {}", usn_p.display()));
-        match parse_usn_file(usn_p, &usn_options(mft_options)) {
-            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, Some(&rel(usn_p)), mft_options),
-            Err(e) => report.fail(format!("{}: {}", usn_p.display(), e)),
-        }
-    }
-
-    for body_p in &body_files {
-        info(quiet, format!("[*] Found bodyfile in triage: {}", body_p.display()));
-        match parse_bodyfile_path(body_p) {
-            Ok(entries) => merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, Some(&rel(body_p)), mft_options),
-            Err(e) => report.fail(format!("{}: {}", body_p.display(), e)),
-        }
-    }
-
-    for img_p in &image_files {
-        info(quiet, format!("[*] Found disk image in directory: {}", img_p.display()));
-        match parse_forensic_image(img_p, mft_options, temp_dir) {
-            Ok((entries, stats)) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(img_p)), mft_options),
-            Err(e) => report.fail(format!("{}: {}", img_p.display(), e)),
-        }
-    }
-
-    // Archives in parallel; each result carries its own success/failure.
-    if !archive_files.is_empty() {
-        use rayon::prelude::*;
-        info(quiet, format!("[*] Processing {} archive(s) in parallel...", archive_files.len()));
-
-        let results: Vec<(PathBuf, Result<Option<(Vec<TimelineEntry>, ResidentStats)>>)> = archive_files
-            .par_iter()
-            .map(|arch_p| (arch_p.clone(), process_archive_fast(arch_p, mft_options, temp_dir)))
-            .collect();
-
-        for (arch_p, res) in results {
-            match res {
-                Ok(Some((entries, stats))) => merge(&mut combined_timeline, &mut total_resident_stats, entries, stats, report, Some(&rel(&arch_p)), mft_options),
-                Ok(None) => report.warn(format!(
-                    "{}: no $MFT, USN journal or bodyfile inside (archives found via -d are not extracted; pass it with -f to timeline its contents)",
-                    arch_p.display()
-                )),
-                Err(e) => report.fail(format!("{}: {}", arch_p.display(), e)),
+    crate::par::ordered(
+        &jobs,
+        |&(i, kind, path)| {
+            let mut part = IngestReport::default();
+            let mut timeline = Vec::new();
+            let mut stats = ResidentStats::default();
+            match kind {
+                Kind::Mft => {
+                    info(quiet, format!("[*] Found MFT in triage: {}", path.display()));
+                    match parse_mft_file(path, mft_options) {
+                        Ok((entries, st)) => merge(&mut timeline, &mut stats, entries, st, &mut part, Some(&rel(path)), mft_options),
+                        Err(e) => part.fail(format!("{}: {}", path.display(), e)),
+                    }
+                }
+                Kind::Usn => {
+                    info(quiet, format!("[*] Found USN journal in triage: {}", path.display()));
+                    match parse_usn_file(path, &usn_options(mft_options)) {
+                        Ok(entries) => merge(&mut timeline, &mut stats, entries, ResidentStats::default(), &mut part, Some(&rel(path)), mft_options),
+                        Err(e) => part.fail(format!("{}: {}", path.display(), e)),
+                    }
+                }
+                Kind::Body => {
+                    info(quiet, format!("[*] Found bodyfile in triage: {}", path.display()));
+                    match parse_bodyfile_path(path) {
+                        Ok(entries) => merge(&mut timeline, &mut stats, entries, ResidentStats::default(), &mut part, Some(&rel(path)), mft_options),
+                        Err(e) => part.fail(format!("{}: {}", path.display(), e)),
+                    }
+                }
+                Kind::Image => {
+                    info(quiet, format!("[*] Found disk image in directory: {}", path.display()));
+                    match parse_forensic_image(path, mft_options, temp_dir) {
+                        Ok((entries, st)) => merge(&mut timeline, &mut stats, entries, st, &mut part, Some(&rel(path)), mft_options),
+                        Err(e) => part.fail(format!("{}: {}", path.display(), e)),
+                    }
+                }
+                Kind::Archive => {
+                    if first_archive == Some(i) {
+                        info(quiet, format!("[*] Processing {} archive(s) in parallel...", archive_files.len()));
+                    }
+                    match process_archive_fast(path, mft_options, temp_dir) {
+                        Ok(Some((entries, st))) => merge(&mut timeline, &mut stats, entries, st, &mut part, Some(&rel(path)), mft_options),
+                        Ok(None) => part.warn(format!(
+                            "{}: no $MFT, USN journal or bodyfile inside (archives found via -d are not extracted; pass it with -f to timeline its contents)",
+                            path.display()
+                        )),
+                        Err(e) => part.fail(format!("{}: {}", path.display(), e)),
+                    }
+                }
             }
-        }
-    }
+            part.timeline = timeline;
+            part.resident_stats = stats;
+            part
+        },
+        |mut part| {
+            combined_timeline.append(&mut part.timeline);
+            let st = std::mem::take(&mut part.resident_stats);
+            total_resident_stats.total_extracted += st.total_extracted;
+            total_resident_stats.total_bytes += st.total_bytes;
+            total_resident_stats.total_failed += st.total_failed;
+            total_resident_stats.total_unsafe_paths += st.total_unsafe_paths;
+            report.absorb(part);
+        },
+    );
 
     let found_artifacts = !(mft_files.is_empty() && usn_files.is_empty() && body_files.is_empty() && image_files.is_empty() && archive_files.is_empty());
 
@@ -558,22 +628,29 @@ fn process_directory_internal(
     };
     if should_walk {
         info(quiet, format!("[*] Processing filesystem structure from: {}", dir_path.display()));
-        let opts = WalkOptions { skip_root: from_archive, mtime_only: from_archive };
-        match walk_directory_timeline_with(dir_path, &opts) {
-            Ok(entries) => {
-                if !from_archive {
-                    report.warn(format!(
-                        "{}: timestamps come from the host filesystem metadata of the files in this directory",
-                        dir_path.display()
-                    ));
-                }
-                merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, None, mft_options)
+        let entries = match source {
+            Source::Archive(members) => timeline_from_archive(members),
+            Source::Host(snap) => {
+                report.warn(format!(
+                    "{}: timestamps come from the host filesystem metadata of the files in this directory",
+                    dir_path.display()
+                ));
+                timeline_from_snapshot(snap, dir_path, &WalkOptions::default())
             }
-            Err(e) => report.fail(format!("{}: {}", dir_path.display(), e)),
-        }
+        };
+        merge(&mut combined_timeline, &mut total_resident_stats, entries, ResidentStats::default(), report, None, mft_options)
     }
 
     (combined_timeline, total_resident_stats)
+}
+
+/// Where the files a directory walk reports come from.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// A directory of the host: its picture, taken before the run read it.
+    Host(&'a TreeSnapshot),
+    /// A folder an archive was extracted into: the times the archive gives.
+    Archive(&'a [archive::ArchiveMember]),
 }
 
 enum Sniffed {
@@ -585,7 +662,7 @@ enum Sniffed {
 }
 
 fn sniff_file(path: &Path) -> std::io::Result<Sniffed> {
-    let mut f = fs::File::open(path)?;
+    let mut f = crate::evidence::open(path)?;
     let mut header = vec![0u8; 1024 + 8];
     let n = f.read(&mut header)?;
     header.truncate(n);
@@ -603,7 +680,7 @@ fn sniff_file(path: &Path) -> std::io::Result<Sniffed> {
         }
     }
     // Text sniff: binary data is simply "unknown", not an error.
-    let f = fs::File::open(path)?;
+    let f = crate::evidence::open(path)?;
     let mut raw = Vec::new();
     let mut reader = BufReader::new(f).take(64 * 1024);
     loop {

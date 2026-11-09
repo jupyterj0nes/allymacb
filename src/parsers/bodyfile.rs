@@ -248,14 +248,14 @@ pub fn parse_bodyfile_stream<R: BufRead>(
 ) -> Vec<TimelineEntry> {
     let (timeline, report) = parse_bodyfile_stream_with_report(reader, prefix);
     if report.lines_rejected > 0 {
-        eprintln!(
+        crate::say!(
             "[!] Bodyfile{}: {} of {} lines rejected",
             prefix.map(|p| format!(" [{}]", p)).unwrap_or_default(),
             report.lines_rejected,
             report.lines_total
         );
         for msg in &report.sample_errors {
-            eprintln!("    {}", msg);
+            crate::say!("    {}", msg);
         }
     }
     timeline

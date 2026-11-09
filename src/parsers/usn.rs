@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -201,7 +200,7 @@ pub fn parse_usn_reader_with_report<R: Read + Seek>(
     let drive_prefix = options.drive_letter.unwrap_or('C');
     let volume = hunt::new_volume();
 
-    let pb = if !options.quiet && total_size > 0 {
+    let pb = if !options.quiet && total_size > 0 && !crate::par::capturing() {
         let pb = ProgressBar::new(total_size);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -384,7 +383,7 @@ pub fn parse_usn_file(
 ) -> Result<Vec<TimelineEntry>> {
     let (timeline, report) = parse_usn_file_with_report(path, options)?;
     if !options.quiet && (report.records_v4_skipped > 0 || report.records_unsupported_version > 0) {
-        eprintln!(
+        crate::say!(
             "    [i] USN: {} records parsed, {} V4 range-tracking records skipped, {} unsupported-version records skipped",
             report.records_parsed, report.records_v4_skipped, report.records_unsupported_version
         );
@@ -396,7 +395,7 @@ pub fn parse_usn_file_with_report(
     path: &Path,
     options: &UsnParseOptions,
 ) -> Result<(Vec<TimelineEntry>, UsnParseReport)> {
-    let file = File::open(path).map_err(|e| AllyError::Io {
+    let file = crate::evidence::open(path).map_err(|e| AllyError::Io {
         code: ErrorCode::FileNotFound,
         source: e,
         context: format!("Opening USN file {}", path.display()),

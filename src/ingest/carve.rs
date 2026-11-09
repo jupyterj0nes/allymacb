@@ -311,6 +311,9 @@ struct Carver<'a> {
     text_seen: HashSet<(i64, u32, &'static str, String)>,
     /// Last bytes of the previous block, scanned together with the next one.
     text_tail: Vec<u8>,
+    /// Blocks waiting for the free-space search, and how many make a batch.
+    text_jobs: Vec<TextJob>,
+    text_batch: usize,
     now: i64,
 }
 
@@ -366,6 +369,46 @@ impl FreeSpace {
     }
 }
 
+/// One block of free-space text search: the bytes from `base`, of which the
+/// first `accept_end` are this block's (the rest is the tail, searched again
+/// with the next block).
+struct TextJob {
+    base: u64,
+    data: Vec<u8>,
+    accept_end: usize,
+}
+
+/// What one free range of a [`TextJob`] holds: the range starts at absolute
+/// offset `s`, at `lo..hi` of the job's bytes.
+struct FreeHits {
+    s: u64,
+    lo: usize,
+    hi: usize,
+    hits: Vec<carve_text::TextHit>,
+}
+
+/// The search of one block, on its own bytes only: the same ranges, slices
+/// and scanners a sequential pass uses.
+fn search_free(free: &FreeSpace, now: i64, job: &TextJob) -> Vec<FreeHits> {
+    let (base, data, filled) = (job.base, &job.data[..], job.data.len());
+    let mut out = Vec::new();
+    for (s, e) in free.ranges_in(base, base + job.accept_end as u64) {
+        let lo = (s - base) as usize;
+        let hi = (e - base) as usize;
+        if hi <= lo {
+            continue;
+        }
+        // A record that starts before `hi` may run on: extend to the end of the free
+        // range or of the data, whichever comes first.
+        let ext = free.ranges_in(e, base + filled as u64).first().filter(|r| r.0 == e).map_or(hi, |r| ((r.1 - base) as usize).min(filled));
+        let slice = &data[lo..ext.max(hi)];
+        let mut hits = carve_text::scan_text(slice, now);
+        hits.extend(carve_text::scan_utmp(slice, now));
+        out.push(FreeHits { s, lo, hi, hits });
+    }
+    out
+}
+
 impl<'a> Carver<'a> {
     fn new(contexts: &[VolumeContext], options: &'a MftParseOptions) -> Result<Self> {
         let mut dedupe = Dedupe { records: HashSet::new(), names: HashSet::new(), indx: HashSet::new(), live_si: HashMap::new() };
@@ -388,6 +431,9 @@ impl<'a> Carver<'a> {
             text_rows: Vec::new(),
             text_seen: HashSet::new(),
             text_tail: Vec::new(),
+            text_jobs: Vec::new(),
+            // Two blocks per thread keep every thread busy; at most 32 (128 MiB) wait.
+            text_batch: (rayon::current_num_threads() * 2).clamp(2, 32),
             now: anomaly::now_secs(),
         })
     }
@@ -397,6 +443,10 @@ impl<'a> Carver<'a> {
     /// every byte once, so the last [`TEXT_TAIL`] bytes are held back and
     /// scanned in front of the next block: a line or record cut by the block
     /// boundary is seen whole. `last` flushes what is held.
+    ///
+    /// The search of a block depends on its bytes alone, so the blocks are
+    /// searched a batch at a time on every thread; what is found is then
+    /// taken in block order, exactly as one thread takes it.
     fn scan_artifacts(&mut self, base: u64, block: &[u8], last: bool) {
         let joined;
         let (base, data): (u64, &[u8]) = if self.text_tail.is_empty() {
@@ -412,23 +462,31 @@ impl<'a> Carver<'a> {
         if !last {
             self.text_tail = data[accept_end..].to_vec();
         }
-        if accept_end == 0 {
-            return;
+        if accept_end > 0 && !self.free.ranges_in(base, base + accept_end as u64).is_empty() {
+            self.text_jobs.push(TextJob { base, data: data.to_vec(), accept_end });
         }
-        let filled = data.len();
-        for (s, e) in self.free.ranges_in(base, base + accept_end as u64) {
-            let lo = (s - base) as usize;
-            let hi = (e - base) as usize;
-            if hi <= lo {
-                continue;
-            }
-            // A record that starts before `hi` may run on: extend to the end of the free
-            // range or of the data, whichever comes first.
-            let ext = self.free.ranges_in(e, base + filled as u64).first().filter(|r| r.0 == e).map_or(hi, |r| ((r.1 - base) as usize).min(filled));
-            let slice = &data[lo..ext.max(hi)];
+        if last || self.text_jobs.len() >= self.text_batch {
+            self.flush_text();
+        }
+    }
+
+    /// Searches the blocks waiting, on every thread, and takes their hits in order.
+    fn flush_text(&mut self) {
+        use rayon::prelude::*;
+        let jobs = std::mem::take(&mut self.text_jobs);
+        let (free, now) = (&self.free, self.now);
+        let found: Vec<Vec<FreeHits>> = jobs.par_iter().map(|j| search_free(free, now, j)).collect();
+        for ranges in found {
+            self.take_hits(ranges);
+        }
+    }
+
+    /// What the search of one block found, taken as one thread takes it:
+    /// the bytes searched counted, a hit that starts in the tail left for the
+    /// next block, a line seen before dropped.
+    fn take_hits(&mut self, ranges: Vec<FreeHits>) {
+        for FreeHits { s, lo, hi, hits } in ranges {
             self.stats.free_bytes_scanned += (hi - lo) as u64;
-            let mut hits = carve_text::scan_text(slice, self.now);
-            hits.extend(carve_text::scan_utmp(slice, self.now));
             for h in hits {
                 if lo + h.offset >= hi {
                     continue; // starts in the tail: next pass
@@ -695,7 +753,28 @@ pub fn carve_stream<R: Read + Seek>(
     label: &str,
     live: &[TimelineEntry],
 ) -> Result<(Vec<TimelineEntry>, CarveStats)> {
-    let carver = RefCell::new(Carver::new(volumes, options)?);
+    carve_stream_with(reader, size, volumes, options, label, live, BLOCK_SIZE, None)
+}
+
+/// [`carve_stream`] with the block size and the free-space search batch
+/// given: tests use small blocks to put many boundaries in little data, and
+/// a batch of 1 searches each block as soon as it is read.
+#[allow(clippy::too_many_arguments)]
+fn carve_stream_with<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+    volumes: &[VolumeContext],
+    options: &MftParseOptions,
+    label: &str,
+    live: &[TimelineEntry],
+    block_size: usize,
+    text_batch: Option<usize>,
+) -> Result<(Vec<TimelineEntry>, CarveStats)> {
+    let mut c = Carver::new(volumes, options)?;
+    if let Some(b) = text_batch {
+        c.text_batch = b;
+    }
+    let carver = RefCell::new(c);
 
     let size = if size == 0 {
         reader
@@ -708,7 +787,7 @@ pub fn carve_stream<R: Read + Seek>(
         .seek(SeekFrom::Start(0))
         .map_err(|e| AllyError::io_with_context(e, format!("Rewinding {} for carving", label)))?;
 
-    let pb = if options.quiet || size == 0 {
+    let pb = if options.quiet || size == 0 || crate::par::capturing() {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(size);
@@ -722,7 +801,7 @@ pub fn carve_stream<R: Read + Seek>(
     };
 
     let mut src = DirectSource::new(reader, size, label.to_string());
-    let cfg = ScanConfig { block_size: BLOCK_SIZE, window: CARRY, step: STEP };
+    let cfg = ScanConfig { block_size, window: CARRY, step: STEP };
     let signatures: [&[u8]; 2] = [FILE_MAGIC, INDX_MAGIC];
 
     // The scanner hands over every aligned `FILE` / `INDX` signature with at least
@@ -762,7 +841,7 @@ pub fn carve_stream<R: Read + Seek>(
     carver.stats.read_errors = stats.read_errors + stats.stalls;
     if !options.quiet {
         for note in stats.notes.iter().take(5) {
-            eprintln!("[!] {}", note);
+            crate::say!("[!] {}", note);
         }
     }
 
@@ -773,7 +852,7 @@ pub fn carve_stream<R: Read + Seek>(
 /// dump of unallocated clusters). Parents are resolved only through other
 /// carved directory records.
 pub fn carve_blob(path: &Path, options: &MftParseOptions) -> Result<(Vec<TimelineEntry>, CarveStats)> {
-    let file = File::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening {} for carving", path.display())))?;
+    let file = crate::evidence::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening {} for carving", path.display())))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(BLOCK_SIZE, file);
     carve_stream(&mut reader, size, &[], options, &path.display().to_string(), &[])
@@ -868,5 +947,111 @@ mod tests {
         assert_eq!(stats.file_records, 1);
         assert_eq!(stats.text_lines, 1, "{rows:?}");
         assert!(rows.iter().any(|e| e.file_name.contains("Accepted publickey")));
+    }
+
+    /// A 1 KiB `FILE` record with valid fixups, `$STANDARD_INFORMATION`-less:
+    /// the scanner counts it and moves past it.
+    fn file_record() -> Vec<u8> {
+        let mut r = vec![0u8; 1024];
+        r[0..4].copy_from_slice(b"FILE");
+        r[4..6].copy_from_slice(&48u16.to_le_bytes());
+        r[6..8].copy_from_slice(&3u16.to_le_bytes());
+        r[20..22].copy_from_slice(&56u16.to_le_bytes());
+        r[24..28].copy_from_slice(&100u32.to_le_bytes());
+        r[28..32].copy_from_slice(&1024u32.to_le_bytes());
+        r[48..50].copy_from_slice(&7u16.to_le_bytes());
+        r[510..512].copy_from_slice(&7u16.to_le_bytes());
+        r[1022..1024].copy_from_slice(&7u16.to_le_bytes());
+        r
+    }
+
+    const TEST_BLOCK: usize = 128 * 1024;
+
+    /// Log lines planted around every block boundary, every tail boundary
+    /// and every carry boundary, a byte apart, some of them twice (the first
+    /// copy is the one kept), and `FILE` records in between. Returns the blob
+    /// and how many distinct lines it holds.
+    fn boundary_blob() -> (Vec<u8>, usize) {
+        let blocks = 14;
+        let mut blob = vec![0u8; TEST_BLOCK * blocks + 777];
+        let mut n = 0usize;
+        let mut distinct = std::collections::BTreeSet::new();
+        let mut plant = |blob: &mut Vec<u8>, at: usize, id: usize| -> usize {
+            let line = format!("
+2026-10-28T20:{:02}:{:02}.{:06}+00:00 host sshd[{}]: Accepted password for u{}
+", (id / 60) % 60, id % 60, id, id, id);
+            let b = line.as_bytes();
+            if at + b.len() > blob.len() {
+                return at;
+            }
+            blob[at..at + b.len()].copy_from_slice(b);
+            distinct.insert(id);
+            at + b.len()
+        };
+        for k in 1..blocks {
+            let edge = k * TEST_BLOCK;
+            // Boundaries the scan and the text search cut at: the block, the
+            // tail held back for the next block, the scanner's carry.
+            for (j, mark) in [edge, edge - TEXT_TAIL, edge - CARRY].into_iter().enumerate() {
+                // A line ending right before the mark, crossing it at
+                // increasing depths, starting on it, and right after it.
+                let shift = (k * 7 + j * 13) % 90;
+                let mut at = mark - 100 - shift;
+                for r in 0..3 {
+                    n += 1;
+                    at = plant(&mut blob, at + r, n) + 3;
+                }
+            }
+            // The same line again, later: the first copy wins.
+            if k % 3 == 0 {
+                plant(&mut blob, edge + 40_000, n);
+            }
+            // Records in the quiet middle of the block, sector aligned.
+            let rec = file_record();
+            let at = edge + 20_480;
+            blob[at..at + 1024].copy_from_slice(&rec);
+        }
+        (blob, distinct.len())
+    }
+
+    fn carve_in(threads: usize, blob: &[u8], volumes: &[VolumeContext], batch: usize) -> (Vec<String>, CarveStats) {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let options = MftParseOptions { quiet: true, ..Default::default() };
+        let (rows, stats) = pool
+            .install(|| carve_stream_with(&mut std::io::Cursor::new(blob.to_vec()), 0, volumes, &options, "blob", &[], TEST_BLOCK, Some(batch)))
+            .unwrap();
+        (rows.iter().map(crate::timeline::format_csv_row).collect(), stats)
+    }
+
+    #[test]
+    fn free_space_search_is_the_same_on_any_number_of_threads() {
+        let (blob, distinct) = boundary_blob();
+        // A batch of 1 searches each block as soon as it is read: the order a
+        // single thread always followed.
+        let (rows, stats) = carve_in(1, &blob, &[], 1);
+        assert_eq!(stats.text_lines, distinct, "every planted line is found once, whatever boundary it crosses");
+        assert_eq!(stats.file_records, 13);
+        for (threads, batch) in [(1, 7), (2, 2), (3, 5), (4, 8), (8, 3), (12, 24)] {
+            let (r, st) = carve_in(threads, &blob, &[], batch);
+            assert_eq!(st, stats, "stats with {threads} threads, batch {batch}");
+            assert_eq!(r, rows, "rows with {threads} threads, batch {batch}");
+        }
+    }
+
+    #[test]
+    fn free_ranges_cut_across_blocks_give_the_same_rows_in_parallel() {
+        let (blob, _) = boundary_blob();
+        // A volume over blocks 2..11 whose free space starts and ends inside
+        // planted lines and across block boundaries.
+        let b = TEST_BLOCK as u64;
+        let free: Vec<(u64, u64)> = vec![(2 * b + 10, b), (3 * b + b / 2, 2 * b + 333), (6 * b - 4000, 8000), (7 * b - 100, 3 * b)];
+        let vol = VolumeContext { start: 2 * b, end: 11 * b, live_mft: None, free_ranges: free, free_known: true, hunt_volume: None, label: Some(Arc::from("p1")) };
+        let (rows, stats) = carve_in(1, &blob, std::slice::from_ref(&vol), 1);
+        assert!(stats.text_lines > 0 && stats.free_bytes_scanned > 0);
+        for (threads, batch) in [(2, 3), (4, 8), (8, 32)] {
+            let (r, st) = carve_in(threads, &blob, std::slice::from_ref(&vol), batch);
+            assert_eq!(st, stats, "stats with {threads} threads");
+            assert_eq!(r, rows, "rows with {threads} threads");
+        }
     }
 }
