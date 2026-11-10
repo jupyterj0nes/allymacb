@@ -22,6 +22,9 @@ fn test_error_code_strings() {
     assert_eq!(ErrorCode::ImageReadFailed.as_str(), "ERR_IMAGE_READ_6001");
     assert_eq!(ErrorCode::ImagePartitionTableCorrupt.as_str(), "ERR_IMAGE_PARTITION_6002");
     assert_eq!(ErrorCode::ImageUnsupportedFormat.as_str(), "ERR_IMAGE_UNSUPPORTED_6003");
+    assert_eq!(ErrorCode::ImageContainerDamaged.as_str(), "ERR_IMAGE_CONTAINER_DAMAGED_6004");
+    assert_eq!(ErrorCode::ImageHasParent.as_str(), "ERR_IMAGE_HAS_PARENT_6005");
+    assert_eq!(ErrorCode::ImageExtentMissing.as_str(), "ERR_IMAGE_EXTENT_MISSING_6006");
     assert_eq!(ErrorCode::BodyfileInvalidFieldCount.as_str(), "ERR_BODYFILE_FIELDS_7001");
     assert_eq!(ErrorCode::BodyfileTimestampInvalid.as_str(), "ERR_BODYFILE_TIMESTAMP_7002");
     assert_eq!(ErrorCode::TimestampOutOfRange.as_str(), "ERR_TIMESTAMP_RANGE_8001");

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Virtual disks, the journal of an image, journals with their paths
+
+- **VMDK, VHD and VHDX are read**, no longer refused with "convert it first": VMDK monolithic sparse, streamOptimized (compressed grains, directory in the footer) and descriptors with FLAT, SPARSE and ZERO extents (split or not, a `.filepart` left by an interrupted upload), ported from faramir; dynamic VHD and VHDX, ported from masstin. The repository's XFS and LVM fixtures give the same rows in every container as raw. New codes: `E6004` damaged container, `E6005` differencing disk or snapshot delta, `E6006` extent missing; `E6003` is left to QCOW and VDI.
+- **The `$UsnJrnl:$J` of an image's NTFS volume is read**, its allocated runs only, and its rows take their folders from the volume's `$MFT`. Before, an image gave no journal rows at all.
+- **A `$J` given with its `$MFT`** (`-f $MFT -f $J`, or `$MFT` beside `$Extend\$J` in a folder, under any usual name, `$UsnJrnl__$J` included) is read after it with its paths: `C:\Users\Public\tool.exe (USN: FILE_CREATE)` instead of `C:\[UNKNOWN]\tool.exe`. Two volumes in one folder are not crossed. A bare `$J` under `$Extend` given alone with `-f` is now recognised as a journal.
+- **The hour of a copied file**: a record flagged `b_after_c` (and not `future`) is judged with the records of the hour it was created in, not the hour of the change time it kept from its source. On the lab, `C:\ProgramData\svch0st.exe` (a copy of hostname.exe made on 2026-11-10) was judged in 2026-11-03T11, the hour of its source's change; now in 2026-11-10T08. It stays `habitual`: with fourteen clean hours measured no share is rarer than one in fifteen, so `b_after_c` alone reaches no state (`docs/anti-forensics.md`).
+
 ## v0.3.0 — 2026-11-09
 
 ### Forensically strict: the run neither shows in the timeline nor writes on the evidence

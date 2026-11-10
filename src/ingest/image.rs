@@ -39,9 +39,10 @@ pub struct PartitionInfo {
     pub ptype: PartitionType,
 }
 
-/// Virtual-disk container formats that are not raw and that this tool does
-/// not decode. Detected by signature so the analyst gets a clear error instead
-/// of an empty timeline.
+/// Virtual-disk container formats that are not raw, detected by signature. VMDK (sparse,
+/// streamOptimized, descriptor), dynamic VHD and VHDX are decoded ([`super::vmdk`],
+/// [`super::vhd`]); QCOW and VDI are refused with a clear error instead of an empty
+/// timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerFormat {
     Vhdx,
@@ -503,6 +504,9 @@ fn parse_partitions<R: Read + Seek + Send + 'static>(
                         let hunt_volume = parsed.timeline.iter().find_map(|e| e.hunt.as_ref()).map(|h| h.volume);
                         super::stamp(&mut parsed.timeline, Some(&format!("{}:$MFT", part_label)), Some(&part_label), None);
                         combined_timeline.extend(parsed.timeline);
+                        let mut usn = std::mem::take(&mut parsed.usn);
+                        super::stamp(&mut usn, Some(&format!("{}:$UsnJrnl:$J", part_label)), Some(&part_label), None);
+                        combined_timeline.extend(usn);
                         total_stats.total_extracted += parsed.stats.total_extracted;
                         total_stats.total_bytes += parsed.stats.total_bytes;
                         total_stats.total_failed += parsed.stats.total_failed;
@@ -770,10 +774,62 @@ pub fn parse_forensic_image(
     let file = crate::evidence::open(image_path).map_err(|e| AllyError::io_with_context(e, format!("Opening raw disk image {}", label)))?;
     let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
-    if let Some(fmt) = detect_container_format(&mut reader) {
-        return Err(unsupported_container(&label, fmt));
+    match detect_container_format(&mut reader) {
+        None => parse_partitions(reader, total_size, &label, mft_options, temp_dir),
+        Some(fmt) => {
+            drop(reader);
+            parse_virtual_disk(image_path, fmt, &label, mft_options, temp_dir)
+        }
     }
-    parse_partitions(reader, total_size, &label, mft_options, temp_dir)
+}
+
+/// Buffer of the readers over a virtual disk: a few grains or blocks per refill.
+const VDISK_BUFFER: usize = 256 * 1024;
+
+/// A VMDK, dynamic VHD or VHDX opened as the virtual disk it holds and walked like a raw
+/// image; the other containers are refused (E6003).
+fn parse_virtual_disk(image_path: &Path, fmt: ContainerFormat, label: &str, mft_options: &MftParseOptions, temp_dir: &Path) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
+    let quiet = mft_options.quiet;
+    let gb = |b: u64| b as f64 / 1_073_741_824.0;
+    match fmt {
+        ContainerFormat::VmdkSparse | ContainerFormat::VmdkDescriptor => {
+            let mut head = [0u8; 4];
+            if let Ok(mut f) = crate::evidence::open(image_path) {
+                let _ = f.read(&mut head);
+            }
+            if &head == b"COWD" {
+                return Err(unsupported_container(label, fmt));
+            }
+            let r = super::vmdk::VmdkReader::open(image_path).map_err(|e| e.into_ally(label))?;
+            let total = r.total_size();
+            if !quiet {
+                crate::say!(
+                    "    [i] VMDK{}: {:.1} GB virtual disk in {} file(s)",
+                    if r.is_stream_optimized() { " (streamOptimized, compressed grains)" } else { "" },
+                    gb(total),
+                    r.extent_files().len()
+                );
+            }
+            parse_partitions(BufReader::with_capacity(VDISK_BUFFER, r), total, label, mft_options, temp_dir)
+        }
+        ContainerFormat::VhdDynamic => {
+            let r = super::vhd::VhdReader::open(image_path).map_err(|e| e.into_ally(label))?;
+            let total = r.total_size();
+            if !quiet {
+                crate::say!("    [i] {} VHD: {:.1} GB virtual disk", if r.is_dynamic() { "Dynamic" } else { "Fixed" }, gb(total));
+            }
+            parse_partitions(BufReader::with_capacity(VDISK_BUFFER, r), total, label, mft_options, temp_dir)
+        }
+        ContainerFormat::Vhdx => {
+            let r = super::vhd::VhdxReader::open(image_path).map_err(|e| e.into_ally(label))?;
+            let total = r.total_size();
+            if !quiet {
+                crate::say!("    [i] VHDX: {:.1} GB virtual disk", gb(total));
+            }
+            parse_partitions(BufReader::with_capacity(VDISK_BUFFER, r), total, label, mft_options, temp_dir)
+        }
+        ContainerFormat::Qcow | ContainerFormat::Vdi => Err(unsupported_container(label, fmt)),
+    }
 }
 
 fn unsupported_container(label: &str, fmt: ContainerFormat) -> AllyError {
@@ -798,6 +854,65 @@ struct NtfsVolumeParse {
     /// Free clusters from `$Bitmap` as volume-relative `(start, len)` byte
     /// ranges; `None` when the bitmap could not be read (or was not asked).
     free_ranges: Option<Vec<(u64, u64)>>,
+    /// Rows of the volume's `$UsnJrnl:$J`, its paths taken from the `$MFT` above.
+    usn: Vec<TimelineEntry>,
+}
+
+/// Copies the allocated part of the volume's `$Extend\$UsnJrnl:$J` to `out`, skipping its
+/// sparse runs (the journal's discarded head can be tens of GB of nothing). Returns the
+/// bytes written, or `None` when the volume has no journal or it cannot be read.
+fn dump_usn_journal<R: Read + Seek>(ntfs: &mut Ntfs, reader: &mut R, out: &Path) -> Option<u64> {
+    use ntfs::indexes::NtfsFileNameIndex;
+    use ntfs::attribute_value::NtfsAttributeValue;
+    ntfs.read_upcase_table(reader).ok()?;
+    let ntfs = &*ntfs;
+    let extend = ntfs.file(reader, 11).ok()?;
+    let index = extend.directory_index(reader).ok()?;
+    let mut finder = index.finder();
+    let entry = NtfsFileNameIndex::find(&mut finder, ntfs, reader, "$UsnJrnl")?.ok()?;
+    let journal = entry.to_file(ntfs, reader).ok()?;
+    let item = journal.data(reader, "$J")?.ok()?;
+    let attr = item.to_attribute().ok()?;
+    let value = attr.value(reader).ok()?;
+    let len = value.len();
+    let mut file = io::BufWriter::new(File::create(out).ok()?);
+    let mut written = 0u64;
+    match value {
+        NtfsAttributeValue::NonResident(nr) => {
+            let mut pos = 0u64;
+            for run in nr.data_runs() {
+                let run = run.ok()?;
+                let size = run.allocated_size();
+                let take = size.min(len.saturating_sub(pos));
+                if take == 0 {
+                    break;
+                }
+                if let Some(at) = run.data_position().value() {
+                    reader.seek(SeekFrom::Start(at.get())).ok()?;
+                    written += io::copy(&mut (&mut *reader).take(take), &mut file).ok()?;
+                }
+                pos += size;
+            }
+        }
+        other => {
+            // Resident, or spread over an attribute list: read it all, leave out the zeros of
+            // the sparse head chunk by chunk.
+            let mut attached = other.attach(reader);
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = attached.read(&mut buf).ok()?;
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].iter().any(|b| *b != 0) {
+                    io::Write::write_all(&mut file, &buf[..n]).ok()?;
+                    written += n as u64;
+                }
+            }
+        }
+    }
+    io::Write::flush(&mut file).ok()?;
+    Some(written)
 }
 
 /// Reads `$Bitmap` (record 6) and returns the unallocated clusters as
@@ -837,7 +952,7 @@ fn extract_and_parse_ntfs<R: Read + Seek>(
     temp_dir: &Path,
     keep_dump: bool,
 ) -> Result<NtfsVolumeParse> {
-    let ntfs = Ntfs::new(reader).map_err(|e| AllyError::Mft {
+    let mut ntfs = Ntfs::new(reader).map_err(|e| AllyError::Mft {
         code: ErrorCode::MftInitFailed,
         entry: None,
         message: format!("Failed reading NTFS volume: {}", e),
@@ -887,11 +1002,42 @@ fn extract_and_parse_ntfs<R: Read + Seek>(
     }
 
     let result = crate::parsers::mft::parse_mft_file(&mft_temp_path, mft_options);
+    // The volume's journal, read with the paths of the $MFT just parsed.
+    let usn = match &result {
+        Ok((timeline, _)) => {
+            let j_path = staging_path(temp_dir, "usn_j", "bin");
+            let rows = match dump_usn_journal(&mut ntfs, reader, &j_path) {
+                Some(bytes) if bytes > 0 => {
+                    let opts = crate::parsers::usn::UsnParseOptions {
+                        drive_letter: mft_options.drive_letter,
+                        quiet: mft_options.quiet,
+                        mft_path_cache: Some(crate::parsers::usn::path_cache_from_mft_rows(timeline)),
+                    };
+                    match crate::parsers::usn::parse_usn_file(&j_path, &opts) {
+                        Ok(rows) => {
+                            if !mft_options.quiet {
+                                crate::say!("    [+] $UsnJrnl:$J: {} timeline entries ({:.1} MB allocated)", rows.len(), bytes as f64 / 1_048_576.0);
+                            }
+                            rows
+                        }
+                        Err(e) => {
+                            crate::say!("    [!] $UsnJrnl:$J unreadable: {}", e);
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let _ = std::fs::remove_file(&j_path);
+            rows
+        }
+        Err(_) => Vec::new(),
+    };
     match result {
-        Ok((timeline, stats)) if keep_dump => Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: Some(mft_temp_path), free_ranges }),
+        Ok((timeline, stats)) if keep_dump => Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: Some(mft_temp_path), free_ranges, usn }),
         Ok((timeline, stats)) => {
             let _ = std::fs::remove_file(&mft_temp_path);
-            Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: None, free_ranges })
+            Ok(NtfsVolumeParse { timeline, stats, volume_size, mft_dump: None, free_ranges, usn })
         }
         Err(e) => {
             let _ = std::fs::remove_file(&mft_temp_path);

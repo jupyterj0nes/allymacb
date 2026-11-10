@@ -6,7 +6,7 @@ use clap::Parser;
     name = "allymacb",
     author = "DFIR Rust Team",
     version,
-    about = "Pure Rust MFT, USN, and Linux Filesystem MACB Timeline Generator\nSupports Forensic Images (E01, RAW, DD, split RAW, fixed VHD), Archives (ZIP, TAR, TAR.GZ), Triages & Loose Files"
+    about = "Pure Rust MFT, USN, and Linux Filesystem MACB Timeline Generator\nSupports Forensic Images (E01, RAW, DD, split RAW, VMDK, VHD, VHDX), Archives (ZIP, TAR, TAR.GZ), Triages & Loose Files"
 )]
 pub struct Cli {
     /// Input file(s): $MFT, $UsnJrnl:$J, bodyfile, forensic disk image (E01, DD, RAW), archive (ZIP, TAR.GZ), etc.

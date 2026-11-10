@@ -17,6 +17,25 @@ use crate::timeline::{action, deleted, source, TimelineEntry};
 /// so RENAME_OLD_NAME / FILE_DELETE records keep their historical name.
 pub type MftPathCache = HashMap<u64, (String, u64)>;
 
+/// The path cache of a journal, from the rows of its volume's `$MFT`: each record number
+/// with its full path and size, the first row of each record; the rows of alternate data
+/// streams (`path:stream`) are left out. Given to [`UsnParseOptions::mft_path_cache`], it
+/// turns `C:\[UNKNOWN]\name` into the record's real directory.
+pub fn path_cache_from_mft_rows(rows: &[TimelineEntry]) -> MftPathCache {
+    let mut cache = MftPathCache::new();
+    for r in rows {
+        if r.source != source::MFT {
+            continue;
+        }
+        let Ok(record) = r.meta.parse::<u64>() else { continue };
+        if r.file_name.get(2..).is_some_and(|rest| rest.contains(':')) {
+            continue;
+        }
+        cache.entry(record).or_insert_with(|| (r.file_name.clone(), r.size));
+    }
+    cache
+}
+
 pub struct UsnParseOptions {
     pub drive_letter: Option<char>,
     pub quiet: bool,
@@ -408,6 +427,26 @@ pub fn parse_usn_file_with_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_cache_takes_the_first_row_of_each_record_and_no_streams() {
+        let row = |meta: &str, name: &str, size: u64, src: &'static str| {
+            TimelineEntry::new(String::new(), 0, 0, size, "m...".into(), String::new(), 0, 0, meta.into(), name.into()).with_source(src)
+        };
+        let rows = vec![
+            row("31", r"C:\Users\Public", 0, source::MFT),
+            row("32", r"C:\Users\Public\report.txt:payload", 3630, source::MFT),
+            row("32", r"C:\Users\Public\report.txt", 24, source::MFT),
+            row("32", r"C:\Users\Public\later-name.txt", 99, source::MFT),
+            row("33", r"C:\[UNKNOWN]\x", 1, source::USN),
+            row("x", r"C:\bad", 1, source::MFT),
+        ];
+        let c = path_cache_from_mft_rows(&rows);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[&31], (r"C:\Users\Public".to_string(), 0));
+        assert_eq!(c[&32], (r"C:\Users\Public\report.txt".to_string(), 24), "the stream row is skipped, the first file row kept");
+        assert!(!c.contains_key(&33), "journal rows are not paths");
+    }
 
     #[test]
     fn action_is_the_strongest_change_of_the_record() {

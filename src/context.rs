@@ -190,6 +190,20 @@ fn times(m: &Macb) -> impl Iterator<Item = i64> {
     [m.m, m.a, m.c, m.b].into_iter().flatten().map(|(s, _)| s)
 }
 
+/// When an NTFS record last changed, for its hour: the `$SI` change time, except for a record
+/// flagged `b_after_c` (and not `future`): a copy keeps the change time of the file it was
+/// copied from, and a record cannot change before it exists, so its creation dates it. A
+/// tool copied into `ProgramData` today is judged with today's hour, not with the hour the
+/// operating system was installed in. A forged future creation is no date: those records
+/// keep their change time.
+fn change_of(si: &Macb, flags: &str) -> Option<i64> {
+    let copied = flags.contains(anomaly::B_AFTER_C) && !flags.contains(anomaly::FUTURE);
+    match (secs(si.c), secs(si.b)) {
+        (Some(c), Some(b)) if copied && b > c => Some(b),
+        _ => secs(si.c).or(secs(si.m)).or(secs(si.b)),
+    }
+}
+
 fn hour_of(secs: i64) -> i64 {
     secs.div_euclid(HOUR)
 }
@@ -214,7 +228,7 @@ fn gather(timeline: &[TimelineEntry]) -> Vec<Rec> {
         let (kind, change, latest, birth) = match &h.evidence {
             Evidence::Ntfs { entry, si, fns, .. } => (
                 Kind::Ntfs,
-                secs(si.c).or(secs(si.m)).or(secs(si.b)),
+                change_of(si, &e.flags),
                 times(si).chain(fns.iter().flat_map(times)).max(),
                 if *entry == 0 { secs(si.b) } else { None },
             ),
@@ -458,6 +472,37 @@ mod tests {
             .with_source(source::MFT)
             .with_flags("ALERT: future".into())
             .with_hunt(Some(hunt::record(volume, Evidence::Ntfs { entry, seq: 1, si, fns: vec![] })))
+    }
+
+    #[test]
+    fn a_copy_is_judged_in_the_hour_it_was_created_not_in_the_hour_of_its_source() {
+        // The 2026-11-10 lab: hostname.exe copied to C:\ProgramData\svch0st.exe two weeks after
+        // the installation. The copy keeps the change time of its source (in the installation
+        // hour), its creation is the copy's. Judged in the creation hour, with the records
+        // that changed then; never folded into the installation window.
+        let mut t = volume();
+        let copy_b = BIRTH + 15 * 86_400; // 2026-11-10T03:36:07Z
+        t.push(ntfs(7, 7000, BIRTH + 61, copy_b, "C:\\ProgramData\\svch0st.exe"));
+        for i in 0..40u64 {
+            let c = copy_b + 100 + i as i64;
+            t.push(ntfs(7, 7100 + i, c, c - 1, &format!("C:\\Users\\x\\f{}", i)));
+        }
+        let s = attach(&mut t, 0.05);
+        let copy = t.iter().find(|e| e.meta == "7000").unwrap();
+        let row = format_csv_row(copy);
+        assert!(!matches!(copy.context.as_deref(), Some(Context::Installed(_))), "a record born after the installation is not baseline: {row}");
+        assert!(row.contains("records changed in 2026-11-10T03 carry b_after_c"), "{row}");
+        assert!(!row.contains("changed in 2026-10-26T03"), "not the hour of the copied file's change time: {row}");
+        // With the clean hours measured so far no share is rarer than one in fifteen: a lone
+        // b_after_c stays habitual (docs/anti-forensics.md, "The hour against clean hours").
+        assert!(row.contains(",habitual,0,"), "{row}");
+        assert_eq!(s[0].install.as_ref().map(|w| w.records), Some(2000), "the window is unchanged");
+        let si = Macb { m: ts(10), a: ts(10), c: ts(10), b: ts(50) };
+        assert_eq!(change_of(&si, "WARN: b_after_c"), Some(50));
+        assert_eq!(change_of(&si, ""), Some(10), "unflagged: the change time");
+        assert_eq!(change_of(&si, "ALERT: b_after_c+future"), Some(10), "a forged future creation is no date");
+        assert_eq!(change_of(&Macb { m: ts(10), a: ts(10), c: ts(60), b: ts(50) }, "WARN: b_after_c"), Some(60));
+        assert_eq!(change_of(&Macb { m: ts(10), a: None, c: None, b: ts(50) }, ""), Some(10));
     }
 
     #[test]

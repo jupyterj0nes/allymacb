@@ -101,7 +101,10 @@ Anything skipped is reported: unreadable images, corrupt archives, rejected body
 | E5003 | `ERR_ARCHIVE_UNSUPPORTED_5003` | Archive type not supported |
 | E6001 | `ERR_IMAGE_READ_6001` | Image read or seek failure |
 | E6002 | `ERR_IMAGE_PARTITION_6002` | No NTFS, ext4, XFS or LVM volume found |
-| E6003 | `ERR_IMAGE_UNSUPPORTED_6003` | VHDX, VMDK, dynamic VHD, QCOW or VDI container |
+| E6003 | `ERR_IMAGE_UNSUPPORTED_6003` | QCOW/QCOW2 or VirtualBox VDI container, or a VMDK extent type that cannot be read |
+| E6004 | `ERR_IMAGE_CONTAINER_DAMAGED_6004` | A VMDK, VHD or VHDX whose header, footer, grain directory, block table or metadata cannot be trusted (truncated streamOptimized export, damaged sparse header, table larger than the file) |
+| E6005 | `ERR_IMAGE_HAS_PARENT_6005` | A differencing VHD/VHDX or a VMDK snapshot delta: it only holds the changes over its parent; give the merged disk |
+| E6006 | `ERR_IMAGE_EXTENT_MISSING_6006` | A VMDK descriptor names an extent file that is not there (only the descriptor was collected) |
 | E7001 | `ERR_BODYFILE_FIELDS_7001` | Bodyfile line does not have 11 fields |
 | E7002 | `ERR_BODYFILE_TIMESTAMP_7002` | Non-numeric timestamp in a bodyfile line |
 | E7003 | `ERR_BODYFILE_NUMERIC_7003` | uid, gid or size is not an unsigned integer |

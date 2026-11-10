@@ -4,6 +4,9 @@ pub mod carve_text;
 pub mod device;
 pub mod image;
 pub mod triage;
+pub mod vdisk;
+pub mod vhd;
+pub mod vmdk;
 
 use std::collections::HashMap;
 use std::fs;
@@ -17,7 +20,7 @@ use crate::error::{AllyError, ErrorCode, Result};
 use crate::parsers::bodyfile::parse_bodyfile_stream;
 use crate::parsers::fs_walk::{timeline_from_archive, timeline_from_snapshot, TreeSnapshot, WalkOptions};
 use crate::parsers::mft::{parse_mft_file, MftParseOptions, ResidentStats};
-use crate::parsers::usn::{parse_usn_file, UsnParseOptions};
+use crate::parsers::usn::{parse_usn_file, path_cache_from_mft_rows, MftPathCache, UsnParseOptions};
 use crate::timeline::TimelineEntry;
 use archive::{extract_archive_with_report, process_archive_fast};
 use image::parse_forensic_image;
@@ -85,6 +88,7 @@ pub fn is_usn_name(path_lower: &str) -> bool {
         || base == "usnjrnl.$j"
         || base == "$j" && p.contains("$extend")
         || (base.contains("usnjrnl") && base.ends_with("$j"))
+        || (base.contains("usnjrnl") && (base.ends_with("_j") || base.ends_with("-j")))
 }
 
 pub fn is_bodyfile_name(base_lower: &str) -> bool {
@@ -209,6 +213,51 @@ fn usn_options(mft_options: &MftParseOptions) -> UsnParseOptions {
     }
 }
 
+/// The folder a `$MFT` or a journal belongs to, for pairing them: the file's folder, and
+/// for a journal under `$Extend` the folder above it (`C/$MFT` and `C/$Extend/$J` share
+/// `c`). Lower case, forward slashes.
+pub(crate) fn artifact_root(path: &str, journal: bool) -> String {
+    let p = path.to_lowercase().replace('\\', "/");
+    let mut parts: Vec<&str> = p.split('/').collect();
+    parts.pop();
+    if journal && parts.last().is_some_and(|d| *d == "$extend") {
+        parts.pop();
+    }
+    parts.join("/")
+}
+
+/// The `$MFT` a journal is read with: the one in its root (see [`artifact_root`]), else the
+/// only one there is. `None` when there is none or the choice is ambiguous.
+pub(crate) fn pair_journal(journal_root: &str, mft_roots: &[String]) -> Option<usize> {
+    let same: Vec<usize> = mft_roots.iter().enumerate().filter(|(_, r)| r.as_str() == journal_root).map(|(i, _)| i).collect();
+    match (same.len(), mft_roots.len()) {
+        (1, _) => Some(same[0]),
+        (0, 1) => Some(0),
+        _ => None,
+    }
+}
+
+/// A journal is a `$J` (by name) that is not an image or an archive.
+fn is_journal_input(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    !is_image_extension(&ext) && !is_archive_extension(&ext) && !is_mft_name(&name) && (is_usn_name(&lower) || name.contains("usnjrnl"))
+}
+
+/// Reads a journal with the path cache of its `$MFT` (or none).
+fn parse_journal(path: &Path, mft_options: &MftParseOptions, cache: Option<MftPathCache>) -> Result<Vec<TimelineEntry>> {
+    let paired = cache.is_some();
+    let mut opts = usn_options(mft_options);
+    opts.mft_path_cache = cache;
+    if paired {
+        info(mft_options.quiet, format!("[*] Parsing USN Journal file with the paths of its $MFT: {}", path.display()));
+    } else {
+        info(mft_options.quiet, format!("[*] Parsing USN Journal file: {}", path.display()));
+    }
+    parse_usn_file(path, &opts)
+}
+
 fn parse_bodyfile_path(path: &Path) -> Result<Vec<TimelineEntry>> {
     let f = crate::evidence::open(path).map_err(|e| AllyError::io_with_context(e, format!("Opening bodyfile {}", path.display())))?;
     // The stem names the host (`server01.body`); `bodyfile.txt` names nothing.
@@ -289,18 +338,58 @@ pub fn process_evidence_inputs(
     let quiet = mft_options.quiet;
 
     // 1. Process explicit individual files: several at a time, put together
-    // in the order given.
+    // in the order given. A journal given with its $MFT (`-f $MFT -f $J`, or
+    // `$Extend/$J` beside `$MFT`) is read after it, with the paths its $MFT
+    // gives: its rows name real folders, not `C:\[UNKNOWN]`.
+    let mft_inputs: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_file() && is_mft_name(&f.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase()))
+        .map(|(i, _)| i)
+        .collect();
+    let mft_roots: Vec<String> = mft_inputs.iter().map(|&i| artifact_root(&files[i].to_string_lossy(), false)).collect();
+    let paired: HashMap<usize, usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_file() && is_journal_input(f))
+        .filter_map(|(i, f)| pair_journal(&artifact_root(&f.to_string_lossy(), true), &mft_roots).map(|k| (i, mft_inputs[k])))
+        .collect();
+    let wanted: std::collections::HashSet<usize> = paired.values().copied().collect();
+    let caches: std::sync::Mutex<HashMap<usize, MftPathCache>> = std::sync::Mutex::new(HashMap::new());
+    let first_pass: Vec<(usize, &PathBuf, &TreeSnapshot)> = file_items.iter().enumerate().filter(|(i, _)| !paired.contains_key(i)).map(|(i, (p, s))| (i, *p, *s)).collect();
     crate::par::ordered(
-        &file_items,
-        |&(file_path, snap)| {
+        &first_pass,
+        |&(i, file_path, snap)| {
             let mut part = IngestReport::default();
             if !file_path.exists() {
                 part.fail(format!("File not found: {}", file_path.display()));
                 return part;
             }
             process_file(file_path, snap, mft_options, &workspace, &mut part);
+            if wanted.contains(&i) {
+                let cache = path_cache_from_mft_rows(&part.timeline);
+                caches.lock().unwrap_or_else(|e| e.into_inner()).insert(i, cache);
+            }
             let name = input_name(file_path);
             stamp(&mut part.timeline, Some(&name), None, None);
+            part
+        },
+        |part| report.absorb(part),
+    );
+    let mut second_pass: Vec<(usize, &PathBuf)> = paired.keys().map(|&i| (i, &files[i])).collect();
+    second_pass.sort_by_key(|(i, _)| *i);
+    let caches = caches.into_inner().unwrap_or_else(|e| e.into_inner());
+    crate::par::ordered(
+        &second_pass,
+        |&(i, file_path)| {
+            let mut part = IngestReport::default();
+            let cache = paired.get(&i).and_then(|m| caches.get(m)).cloned();
+            match parse_journal(file_path, mft_options, cache) {
+                Ok(entries) => part.ok(entries, ResidentStats::default()),
+                Err(e) => part.fail(format!("{}: {}", file_path.display(), e)),
+            }
+            fill_drive(&mut part.timeline, mft_options);
+            stamp(&mut part.timeline, Some(&input_name(file_path)), None, None);
             part
         },
         |part| report.absorb(part),
@@ -387,7 +476,7 @@ fn process_file(file_path: &Path, snap: &TreeSnapshot, mft_options: &MftParseOpt
             Ok((entries, stats)) => report.ok(entries, stats),
             Err(e) => report.fail(format!("{}: {}", file_path.display(), e)),
         }
-    } else if is_usn_name(&fname_lower) || fname_lower.contains("usnjrnl") {
+    } else if is_usn_name(&file_path.to_string_lossy().to_lowercase()) || fname_lower.contains("usnjrnl") {
         info(quiet, format!("[*] Parsing USN Journal file: {}", file_path.display()));
         match parse_usn_file(file_path, &usn_options(mft_options)) {
             Ok(entries) => report.ok(entries, ResidentStats::default()),
@@ -553,9 +642,15 @@ fn process_directory_internal(
     let first_archive = jobs.iter().position(|j| j.0 == Kind::Archive);
     let jobs: Vec<(usize, Kind, &PathBuf)> = jobs.into_iter().enumerate().map(|(i, (k, p))| (i, k, p)).collect();
 
-    crate::par::ordered(
-        &jobs,
-        |&(i, kind, path)| {
+    // A journal is read after the $MFT of its volume (same folder, or the folder above its
+    // `$Extend`), with the paths that $MFT gives.
+    let mft_roots: Vec<String> = mft_files.iter().map(|p| artifact_root(&rel(p), false)).collect();
+    let journal_mft: HashMap<&PathBuf, &PathBuf> = usn_files.iter().filter_map(|u| pair_journal(&artifact_root(&rel(u), true), &mft_roots).map(|k| (u, &mft_files[k]))).collect();
+    let wanted: std::collections::HashSet<&PathBuf> = journal_mft.values().copied().collect();
+    let caches: std::sync::Mutex<HashMap<PathBuf, MftPathCache>> = std::sync::Mutex::new(HashMap::new());
+    type Jobs<'a> = Vec<(usize, Kind, &'a PathBuf)>;
+    let (second, first): (Jobs, Jobs) = jobs.into_iter().partition(|(_, k, p)| *k == Kind::Usn && journal_mft.contains_key(p));
+    let run_job = |&(i, kind, path): &(usize, Kind, &PathBuf)| {
             let mut part = IngestReport::default();
             let mut timeline = Vec::new();
             let mut stats = ResidentStats::default();
@@ -563,13 +658,20 @@ fn process_directory_internal(
                 Kind::Mft => {
                     info(quiet, format!("[*] Found MFT in triage: {}", path.display()));
                     match parse_mft_file(path, mft_options) {
-                        Ok((entries, st)) => merge(&mut timeline, &mut stats, entries, st, &mut part, Some(&rel(path)), mft_options),
+                        Ok((entries, st)) => {
+                            if wanted.contains(path) {
+                                let cache = path_cache_from_mft_rows(&entries);
+                                caches.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), cache);
+                            }
+                            merge(&mut timeline, &mut stats, entries, st, &mut part, Some(&rel(path)), mft_options)
+                        }
                         Err(e) => part.fail(format!("{}: {}", path.display(), e)),
                     }
                 }
                 Kind::Usn => {
                     info(quiet, format!("[*] Found USN journal in triage: {}", path.display()));
-                    match parse_usn_file(path, &usn_options(mft_options)) {
+                    let cache = journal_mft.get(path).and_then(|m| caches.lock().unwrap_or_else(|e| e.into_inner()).get(m.as_path()).cloned());
+                    match parse_journal(path, mft_options, cache) {
                         Ok(entries) => merge(&mut timeline, &mut stats, entries, ResidentStats::default(), &mut part, Some(&rel(path)), mft_options),
                         Err(e) => part.fail(format!("{}: {}", path.display(), e)),
                     }
@@ -605,17 +707,18 @@ fn process_directory_internal(
             part.timeline = timeline;
             part.resident_stats = stats;
             part
-        },
-        |mut part| {
-            combined_timeline.append(&mut part.timeline);
-            let st = std::mem::take(&mut part.resident_stats);
-            total_resident_stats.total_extracted += st.total_extracted;
-            total_resident_stats.total_bytes += st.total_bytes;
-            total_resident_stats.total_failed += st.total_failed;
-            total_resident_stats.total_unsafe_paths += st.total_unsafe_paths;
-            report.absorb(part);
-        },
-    );
+    };
+    let mut collect = |mut part: IngestReport| {
+        combined_timeline.append(&mut part.timeline);
+        let st = std::mem::take(&mut part.resident_stats);
+        total_resident_stats.total_extracted += st.total_extracted;
+        total_resident_stats.total_bytes += st.total_bytes;
+        total_resident_stats.total_failed += st.total_failed;
+        total_resident_stats.total_unsafe_paths += st.total_unsafe_paths;
+        report.absorb(part);
+    };
+    crate::par::ordered(&first, run_job, &mut collect);
+    crate::par::ordered(&second, run_job, &mut collect);
 
     let found_artifacts = !(mft_files.is_empty() && usn_files.is_empty() && body_files.is_empty() && image_files.is_empty() && archive_files.is_empty());
 
@@ -730,6 +833,25 @@ mod tests {
         assert!(is_usn_name("C\\$Extend\\$J".to_lowercase().as_str()));
         assert!(!is_usn_name("c/users/x/$j"));
         assert!(!is_usn_name("$mft"));
+        assert!(is_usn_name("c/$extend/$usnjrnl__$j"), "an ADS copied out as <name>__<stream>");
+        assert!(is_usn_name("usnjrnl_j"));
+        assert!(is_usn_name("c/$extend/$usnjrnl-$j"));
+    }
+
+    #[test]
+    fn journals_pair_with_the_mft_of_their_volume() {
+        assert_eq!(artifact_root(r"C\$MFT", false), "c");
+        assert_eq!(artifact_root(r"C\$Extend\$J", true), "c", "the folder above $Extend");
+        assert_eq!(artifact_root("C/$UsnJrnl_$J", true), "c");
+        assert_eq!(artifact_root("$J", true), "");
+        assert_eq!(artifact_root("x/$extend/$extend/$j", true), "x/$extend", "only one $Extend is climbed");
+        let roots = vec!["c".to_string(), "d".to_string()];
+        assert_eq!(pair_journal("d", &roots), Some(1));
+        assert_eq!(pair_journal("e", &roots), None, "two volumes and no match: ambiguous");
+        assert_eq!(pair_journal("e", &roots[..1]), Some(0), "the only $MFT there is");
+        assert_eq!(pair_journal("c", &[]), None);
+        let twice = vec!["c".to_string(), "c".to_string()];
+        assert_eq!(pair_journal("c", &twice), None, "two $MFTs in one folder: ambiguous");
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub enum ErrorCode {
     ImageReadFailed = 6001,
     ImagePartitionTableCorrupt = 6002,
     ImageUnsupportedFormat = 6003,
+    ImageContainerDamaged = 6004,
+    ImageHasParent = 6005,
+    ImageExtentMissing = 6006,
 
     // Bodyfile (E7xxx)
     BodyfileInvalidFieldCount = 7001,
@@ -81,6 +84,9 @@ impl ErrorCode {
             ErrorCode::ImageReadFailed => "ERR_IMAGE_READ_6001",
             ErrorCode::ImagePartitionTableCorrupt => "ERR_IMAGE_PARTITION_6002",
             ErrorCode::ImageUnsupportedFormat => "ERR_IMAGE_UNSUPPORTED_6003",
+            ErrorCode::ImageContainerDamaged => "ERR_IMAGE_CONTAINER_DAMAGED_6004",
+            ErrorCode::ImageHasParent => "ERR_IMAGE_HAS_PARENT_6005",
+            ErrorCode::ImageExtentMissing => "ERR_IMAGE_EXTENT_MISSING_6006",
             ErrorCode::BodyfileInvalidFieldCount => "ERR_BODYFILE_FIELDS_7001",
             ErrorCode::BodyfileTimestampInvalid => "ERR_BODYFILE_TIMESTAMP_7002",
             ErrorCode::BodyfileNumericFieldInvalid => "ERR_BODYFILE_NUMERIC_7003",

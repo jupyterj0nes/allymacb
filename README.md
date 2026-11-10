@@ -50,7 +50,7 @@ cargo build --release          # binary in target/release/allymacb[.exe], no C l
 | You have | Run |
 | :--- | :--- |
 | An `$MFT` and its USN journal | `allymacb -f '$MFT' -u '$J' -n -o host01.csv` |
-| A disk image (E01, raw, dd, split `.001`, fixed VHD) | `allymacb -f disk.E01 -o disk.csv` |
+| A disk image (E01, raw, dd, split `.001`, VMDK, VHD, VHDX) | `allymacb -f disk.E01 -o disk.csv` |
 | A KAPE or Velociraptor zip, a UAC tar.gz | `allymacb -f triage.zip -o host.csv` |
 | A folder of collections from many hosts | `allymacb -d /evidence/uac -o fleet.csv` |
 | A suspicion that files were deleted or the volume was reformatted | `allymacb -f disk.E01 --carve -o disk.csv` |
@@ -104,7 +104,9 @@ All 19 columns, what each source fills, exit codes and error codes: [Output →]
 | Directories | `-d` | KAPE, Velociraptor or UAC output, or a plain tree (timelined from its metadata, with a warning) |
 | Raw sectors | `--carve` | NTFS records and `$I30` entries anywhere, the ext4 journal, log lines and `utmp` records in free space, through the [blockcarve](https://github.com/jupyterj0nes/blockcarve) crate shared with masstin, faramir and caarea |
 
-VHDX, sparse VMDK, dynamic VHD, QCOW and VDI are recognised and refused with a clear error: convert them to raw first.
+Virtual disks are read as the disk they hold: VMDK (monolithic sparse, streamOptimized as VMware, OVF and cloud exports write it, and descriptors with FLAT, SPARSE and ZERO extents, split or not), VHD (fixed and dynamic) and VHDX (fixed and dynamic). A differencing VHD/VHDX or a VMDK snapshot delta holds only the changes over its parent and is refused (`E6005`); a descriptor whose extent was not collected is `E6006`; a truncated export or a damaged header is `E6004`. QCOW and VDI are recognised and refused (`E6003`): convert them to raw first.
+
+From an NTFS volume of an image the `$UsnJrnl:$J` is read along with the `$MFT` (its allocated part only, not the sparse head), and its rows take their folders from that `$MFT`. The same holds for a `$J` given with the `$MFT` of its volume: `-f $MFT -f $J`, or a folder with `$MFT` beside `$Extend\$J` (any of the usual names: `$J`, `$UsnJrnl%3A$J`, `$UsnJrnl_$J`, `$UsnJrnl__$J`, `UsnJrnl_J`).
 
 ## Usage
 
@@ -155,8 +157,8 @@ Every number in this README was measured. The details are in [How it was checked
 * XFS: a freed inode keeps its times but not its type or size. Its name comes back only from the slack of a directory stored in blocks; a small directory kept inside its inode is compacted on removal and keeps nothing. The log holds operations, not block copies, so there are no older inode states as on ext4.
 * LVM: linear logical volumes that lie on the physical volume being read. A volume that is striped, mirrored, thin or spread over a second disk is reported as unreadable and the exit code says the timeline is partial. `--carve` does not look for logs in the free space of a logical volume.
 * A non-resident `$ATTRIBUTE_LIST` cannot be followed from a loose `$MFT`.
-* USN rows carry the record's name and MFT entry, not a full path.
-* VHDX, VMDK, dynamic VHD, QCOW and VDI are not decoded.
+* A journal read without the `$MFT` of its volume names its folders `C:\[UNKNOWN]`; so does a record whose parent folder no longer exists in the `$MFT`.
+* QCOW and VDI are not decoded; differencing disks and VMDK snapshot deltas are not merged with their parents.
 * Nothing is recovered from old `$UsnJrnl` or `$LogFile` data, compressed rotated logs or journald's binary files. Encrypted or compressed containers (BitLocker, hiberfil) stay closed.
 * The hunt leaves out ext4 volumes read through the fallback and directories of loose files. It joins a `$J` to an `$MFT` only when the run holds exactly one live `$MFT`. A reused record whose times were all moved back before the cutoff can only be placed by the journal.
 
