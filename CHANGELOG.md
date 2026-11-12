@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-11-12
 
 ### Virtual disks, the journal of an image, journals with their paths
 
