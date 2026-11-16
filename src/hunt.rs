@@ -424,10 +424,17 @@ pub struct Mark {
 /// Top of the `hunt_score` scale.
 pub const SCORE_MAX: u8 = 100;
 
-/// The `hunt_score` of a q-value, as masstin computes it: `-10 log10 q`,
-/// rounded and capped at 100 (the Phred scale). 0 is no rarer than chance,
-/// 13 one in twenty (where `significant` starts at the default alpha), 20
-/// one in a hundred, 30 one in a thousand. None for NaN (no test).
+/// The `hunt_score` of a rarity, the scale of the four tools: `-10 log10`
+/// of a probability, rounded and capped at 100. 0 is like any other, 13
+/// one in twenty, 20 one in a hundred, 30 one in a thousand. None for NaN
+/// (not judged).
+///
+/// The probability is the share of normal records that look at least as
+/// unusual: of the baseline records of the volume, regular and irregular,
+/// how many score at least as high on the joint test (add-one corrected).
+/// It is what an indicator's points are on its reference (`anomaly`): the
+/// share of clean records it fires on. It is not the q-value, which is
+/// corrected for every record put to the test and decides `significant`.
 pub fn score_of(q: f64) -> Option<u8> {
     if q.is_nan() {
         return None;
@@ -481,6 +488,9 @@ pub struct Finding {
     /// NaN when not evaluated.
     pub p: f64,
     pub q: f64,
+    /// The share of the volume's baseline records, regular ones included,
+    /// that are at least as unusual: what `hunt_score` is made of.
+    pub rarity: f64,
     pub t: f64,
     pub state: State,
     pub significant: bool,
@@ -759,6 +769,8 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
         t: f64,
         marg: [(usize, usize); K],
         n: usize,
+        /// every baseline record the null was drawn from, regular or not
+        n_all: usize,
         days: usize,
     }
     let mut tested: Vec<Tested> = Vec::new();
@@ -777,6 +789,10 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
             .copied()
             .filter(|&i| rows[i].activity < opts.from && journal_from.is_none_or(|j| rows[i].activity >= j) && irregular(&rows[i]))
             .collect();
+        // the same baseline records with the regular ones: what "one record
+        // in N" is counted over (a regular record is never at least as
+        // unusual as an irregular one: it only counts in the N)
+        let n_all = in_volume.iter().filter(|&&i| rows[i].activity < opts.from && journal_from.is_none_or(|j| rows[i].activity >= j)).count();
         let test_idx: Vec<usize> = in_volume.iter().copied().filter(|&i| rows[i].activity >= opts.from && irregular(&rows[i])).collect();
         let window = in_volume.len() - baseline;
         let null_rows: Vec<[f64; K]> = null_idx.iter().map(|&i| rows[i].x).collect();
@@ -798,7 +814,7 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
             window,
             test_idx.len(),
             if evaluated { "tested" } else { "not evaluated, nothing to compare them with" },
-            score_of(stats::empirical_p(0, null_idx.len())).unwrap_or(0),
+            score_of(stats::empirical_p(0, n_all)).unwrap_or(0),
             if off.is_empty() { String::new() } else { format!("; off for lack of resolution: {}", off.join(", ")) },
         ));
         for &i in &in_volume {
@@ -823,7 +839,7 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
                     *m = jn.marginal(k, rows[i].x[k]);
                 }
             }
-            tested.push(Tested { row: i, evaluated, p, t, marg, n: jn.n, days: n_days });
+            tested.push(Tested { row: i, evaluated, p, t, marg, n: jn.n, n_all, days: n_days });
         }
     }
 
@@ -864,7 +880,10 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
             })
             .collect();
         let why = why.join("; ");
-        report.marks.insert(u.rec.unit, Arc::new(Mark { state, score: score_of(q[j]), why: why.clone() }));
+        // (1 + null records at least as unusual) is p x (N + 1), counted
+        // over every baseline record
+        let rarity = if ts.evaluated { (ts.p * (ts.n as f64 + 1.0) / (ts.n_all as f64 + 1.0)).min(1.0) } else { f64::NAN };
+        report.marks.insert(u.rec.unit, Arc::new(Mark { state, score: score_of(rarity), why: why.clone() }));
         let mut logs = u.sources.clone();
         if row.journal > 0 {
             logs.insert(source::USN);
@@ -883,6 +902,7 @@ pub fn run(timeline: &[TimelineEntry], opts: &HuntOptions) -> HuntReport {
             activity: row.activity,
             p: ts.p,
             q: q[j],
+            rarity,
             t: ts.t,
             state,
             significant: state == State::Significant,
@@ -998,7 +1018,7 @@ pub fn parse_cutoff(s: &str) -> Option<i64> {
 /// `sources` for `events` and `logs`, `related` and `group` (empty for now)
 /// for `chain` and `campaign`, `lookup` (the record's rows in the timeline)
 /// for `cypher_snippet`.
-pub const HUNT_HEADER: &str = "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,volume,file_name,owner,rules,rows,sources,signature,why_unusual,evidence,related,group,lookup";
+pub const HUNT_HEADER: &str = "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,volume,file_name,owner,rules,rows,sources,signature,why_unusual,evidence,related,group,lookup,rarity,hunt_score";
 
 /// Writes every tested record, significant first.
 pub fn write_csv(report: &HuntReport, path: &Path) -> Result<()> {
@@ -1008,7 +1028,7 @@ pub fn write_csv(report: &HuntReport, path: &Path) -> Result<()> {
     for (i, f) in report.findings.iter().enumerate() {
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,{},{},{}",
             i + 1,
             match f.state {
                 State::Significant => "yes",
@@ -1030,6 +1050,8 @@ pub fn write_csv(report: &HuntReport, path: &Path) -> Result<()> {
             escape_csv_text(&f.why),
             escape_csv_text(&f.evidence),
             escape_csv_text(&format!("meta={}", f.meta)),
+            fmt_p(f.rarity),
+            score_of(f.rarity).map(|s| s.to_string()).unwrap_or_default(),
         )
         .map_err(csv_err)?;
     }
@@ -1039,7 +1061,7 @@ pub fn write_csv(report: &HuntReport, path: &Path) -> Result<()> {
 /// Short form of one finding for stderr.
 pub fn describe(f: &Finding) -> String {
     let first = f.evidence.split("; ").next().unwrap_or("");
-    let score = score_of(f.q).unwrap_or(0);
+    let score = score_of(f.rarity).unwrap_or(0);
     format!("score {:>2} ({}) {:<13} {}  (meta {}): {}", score, score_words(score), f.signature.as_str(), f.file_name, f.meta, first)
 }
 

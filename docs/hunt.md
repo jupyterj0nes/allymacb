@@ -39,14 +39,14 @@ The output follows masstin. Every row of the timeline gets the verdict on its re
 | `baseline` | Active before the cutoff: reference, not judged |
 | *(empty)* | The row did not enter the hunt: no `--investigation-from`, a directory of loose files, an ext4 volume read through `ext4-view`, a USN record not joined to an `$MFT` record |
 
-A rule speaks in the same columns (see [Anti-forensics indicators](anti-forensics.md)): the stronger state wins, the points add, and the rule's clause comes before the hunt's words.
+A rule speaks in the same columns (see [Anti-forensics indicators](anti-forensics.md)): the stronger state wins, the record takes the stronger of the two scores, and the rule's clause comes before the hunt's words. (The hunt and the rules read the same timestamps, one against the volume's own baseline and the others against the reference volumes: one fact measured twice, so the scores are not added.)
 
-`hunt_score` is the q-value turned into a number people can read and filter, as masstin writes it: `-10 · log10(q)`, rounded, capped at 100. Ten points are one order of magnitude.
+`hunt_score` is how rare the record is among the records of the volume's baseline, as a number people can read and filter: of the baseline records, regular and irregular, how many look at least as unusual on the joint test; `-10 · log10((1 + that count) / (1 + baseline records))`, rounded, capped at 100. Ten points are one order of magnitude. It is the quantity a rule's points are on its reference (the share of clean records it fires on), the convention of the four tools (masstin `docs/csv-format.md`). It is not the q-value: that one is corrected for every record put to the test and decides `significant`. The run prints the highest score the volume can give, one in (baseline records + 1). Both numbers are in `--hunt-out` (`p_value`, `q_value`, `rarity`, `hunt_score`).
 
-| `hunt_score` | q | Read as |
+| `hunt_score` | share | Read as |
 |---|---|---|
-| 0 | 1 | no rarer than chance (every `habitual` record) |
-| 13 | 0.05 | one in twenty (the default `--alpha`: `significant` starts here) |
+| 0 | 1 | like any other (every `habitual` record) |
+| 13 | 0.05 | one baseline record in twenty looks at least this unusual |
 | 20 | 0.01 | one in a hundred |
 | 30 | 0.001 | one in a thousand |
 

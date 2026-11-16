@@ -239,8 +239,15 @@ fn hunt_csv_has_one_row_per_tested_record() {
     let first = lines.next().unwrap();
     assert!(first.starts_with("1,yes,"), "{}", first);
     assert!(first.contains("stomped.exe"));
-    assert!(first.ends_with(&format!(",meta={}", rep.findings[0].meta)), "{}", first);
-    assert_eq!(hunt::HUNT_HEADER.split(',').count(), 19, "masstin's findings table");
+    // the 19 columns of masstin's findings table, then the two it adds: the
+    // rarity (the share of ALL the volume's baseline records at least as
+    // unusual) and the score made of it
+    let f = &rep.findings[0];
+    assert!(first.contains(&format!(",meta={},", f.meta)), "{}", first);
+    assert!(f.rarity <= f.p && f.rarity > 0.0, "counted over more records than the test's p: {} {}", f.rarity, f.p);
+    assert!(first.ends_with(&format!(",{}", hunt::score_of(f.rarity).unwrap())), "{}", first);
+    assert!(hunt::score_of(f.rarity) > hunt::score_of(f.q), "a rarity, not the q-value: {} {}", f.rarity, f.q);
+    assert_eq!(hunt::HUNT_HEADER.split(',').count(), 21, "masstin's findings table");
     assert_eq!(text.lines().count(), rep.findings.len() + 1);
 }
 

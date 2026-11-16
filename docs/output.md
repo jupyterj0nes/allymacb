@@ -36,7 +36,7 @@ The 19 columns are those of [masstin's timeline](https://github.com/jupyterj0nes
 | 13 | `detail` | `file_name` | Full path, with tags: `($FILE_NAME: name)`, `(USN: REASON+REASON)`, `($I30)`, `(carved @0xOFFSET)`. |
 | 14 | `log_filename` | `evidence` | The input the row was read from, outermost first: `disk.E01:p2:$MFT`, `kape.zip:C/$MFT`, `triage:C/$Extend/$UsnJrnl%3A$J`. |
 | 15 | `hunt` | `hunt` | The verdict on the row's file (see below). |
-| 16 | `hunt_score` | `hunt_score` | How rare the file is, 0 to 100, on masstin's scale: the [statistical hunt](hunt.md)'s `-10 · log10(q)` plus the measured rarity of its [rules](anti-forensics.md), capped at 100. |
+| 16 | `hunt_score` | `hunt_score` | How rare the file is, 0 to 100, on the scale of the four tools (`-10 · log10` of the share of normal records that show at least this): the stronger of the [statistical hunt](hunt.md)'s rarity on the volume's own baseline and the measured rarity of its [rules](anti-forensics.md), capped at 100. |
 | 17 | `hunt_why` | `hunt_why` | One clause per rule, `rule <id> (<level>): ...`, strongest first, then what the hunt found unusual, in words. Clauses are separated by `; `. |
 | 18 | `verdict` | `verdict` | The analyst's; written empty. |
 | 19 | `notes` | `notes` | The analyst's; written empty. |

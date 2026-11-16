@@ -324,9 +324,12 @@ fn tail(entry: &TimelineEntry) -> String {
     }
     // a record where only noise rules fired and no test spoke: no state, no score, the clause
     let word = state.map(State::as_str).unwrap_or("");
-    // Test and rules add, capped at masstin's top; the baseline is not scored.
+    // The test and the rules read the same timestamps, one on the volume's
+    // own baseline and the others on the reference volumes: the same fact
+    // measured twice, not two facts. The record takes the stronger of the
+    // two (adding them counted it twice); the baseline is not scored.
     let score = match (mark.and_then(|m| m.score), &rules) {
-        (s, Some(r)) => Some((u32::from(s.unwrap_or(0)) + r.points).min(u32::from(SCORE_MAX))),
+        (s, Some(r)) => Some(u32::from(s.unwrap_or(0)).max(r.points).min(u32::from(SCORE_MAX))),
         (s, None) => s.map(u32::from),
     };
     let score = score.filter(|_| !word.is_empty() && state != Some(State::Baseline)).map(|s| s.to_string()).unwrap_or_default();

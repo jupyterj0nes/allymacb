@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **`hunt_score` is one quantity in the four tools: the share of normal records that show at least this.** The hunt wrote `-10 · log10(q)`; the q-value is corrected for every record put to the test and is not a rarity, so the hunt's findings read lower than a rule saying the same thing. The hunt now writes how rare the record is among ALL the baseline records of its volume, regular ones included (the count of the p-value over the whole baseline), which is what a rule's points are on its reference. `significant` is still decided on q. The hunt and the rules of a record no longer add (they read the same timestamps, measured on two references): the record takes the stronger of the two. `--hunt-out` gains two columns at the end, `rarity` and `hunt_score`. On a lab `$MFT` (518,664 records) no state changes and the scores of the 26,043 tested rows rise by 2 to 22 points (median 5).
+
 ## v0.4.0 — 2026-11-12
 
 ### Virtual disks, the journal of an image, journals with their paths
