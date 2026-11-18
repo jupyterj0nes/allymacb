@@ -306,6 +306,21 @@ fn route_member<R: Read>(
     let lower = name.to_lowercase().replace('\\', "/");
     let base = lower.rsplit('/').next().unwrap_or(&lower);
 
+    // The file listing of a Cortex XDR online triage (`bodyfile/bodyfile.csv`):
+    // a bodyfile written as a table, times in milliseconds. Its rows carry
+    // the host the triage was taken from; the name of the download does not.
+    if base == "bodyfile.csv" {
+        return Ok(match crate::parsers::bodyfile::CortexListing::open(BufReader::new(reader)) {
+            Some(listing) => {
+                let host = listing.host().map(str::to_string);
+                let entries = parse_bodyfile_stream(BufReader::new(listing), Some(host.as_deref().unwrap_or(container_name)));
+                log(mft_options.quiet, format!("    [+] Cortex XDR file listing: {} timeline entries from {}{}", entries.len(), name, host.map(|h| format!(" (host {h})")).unwrap_or_default()));
+                acc.merge(entries, ResidentStats::default(), name, None);
+                true
+            }
+            None => false,
+        });
+    }
     if is_bodyfile_name(base) {
         let entries = parse_bodyfile_stream(BufReader::new(reader), Some(container_name));
         log(mft_options.quiet, format!("    [+] Bodyfile: {} timeline entries from {}", entries.len(), name));

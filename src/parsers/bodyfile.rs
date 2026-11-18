@@ -182,6 +182,168 @@ fn hunt_record(line: &str, volume: u32) -> Option<Arc<HuntRecord>> {
     Some(hunt::record(volume, evidence))
 }
 
+/// One record of a CSV stream (RFC 4180: quoted fields, `""` for a quote, a
+/// line break inside quotes). `Ok(false)` at the end of the stream.
+fn read_csv_record<R: BufRead>(reader: &mut R, fields: &mut Vec<String>) -> std::io::Result<bool> {
+    fields.clear();
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let before = raw.len();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            if raw.is_empty() {
+                return Ok(false);
+            }
+            break;
+        }
+        // a record ends at a line break outside quotes: an even number of them so far
+        if raw.iter().filter(|b| **b == b'"').count() % 2 == 0 {
+            break;
+        }
+        if raw.len() == before {
+            break;
+        }
+    }
+    while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
+        raw.pop();
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            ('"', _) => quoted = !quoted,
+            (',', false) => fields.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    fields.push(field);
+    Ok(true)
+}
+
+/// Columns of the file listing a Cortex XDR online triage brings
+/// (`bodyfile/bodyfile.csv`): the fields of a bodyfile, as a CSV table and
+/// with the four times in milliseconds.
+const CORTEX_LISTING_COLUMNS: [&str; 11] = ["md5", "name", "inode", "mode_as_string", "uid", "gid", "size", "atime", "mtime", "ctime", "crtime"];
+
+/// The file listing of a Cortex XDR online triage, read as the bodyfile it
+/// is: each row of the table comes out as one TSK bodyfile line
+/// (`MD5|name|inode|mode|UID|GID|size|atime|mtime|ctime|crtime`), its times
+/// in whole seconds.
+pub struct CortexListing<R: BufRead> {
+    reader: R,
+    /// position of each bodyfile field in the table, in bodyfile order
+    cols: [Option<usize>; 11],
+    host_col: Option<usize>,
+    host: Option<String>,
+    buf: Vec<u8>,
+    pos: usize,
+    fields: Vec<String>,
+    done: bool,
+}
+
+impl<R: BufRead> CortexListing<R> {
+    /// `None` when the stream is not that table: its header must name the
+    /// file, its inode and its four times.
+    pub fn open(mut reader: R) -> Option<Self> {
+        let mut header = Vec::new();
+        if !read_csv_record(&mut reader, &mut header).ok()? {
+            return None;
+        }
+        let at = |name: &str| header.iter().position(|h| h.trim().trim_start_matches('\u{feff}') == name);
+        let mut cols = [None; 11];
+        for (i, name) in CORTEX_LISTING_COLUMNS.iter().enumerate() {
+            cols[i] = at(name);
+        }
+        // md5, uid, gid and size may be missing; the name, the inode and the times may not
+        if [1usize, 2, 7, 8, 9, 10].iter().any(|i| cols[*i].is_none()) {
+            return None;
+        }
+        let mut listing = Self { reader, cols, host_col: at("host_name"), host: None, buf: Vec::new(), pos: 0, fields: Vec::new(), done: false };
+        // the first row is read now: it names the host the listing is of
+        listing.fill();
+        Some(listing)
+    }
+
+    /// The host the triage was taken from (the table's `host_name` column).
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    /// Milliseconds since 1970 as bodyfile seconds: `1709294400123` -> `1709294400`.
+    /// A bodyfile's times are whole seconds; the milliseconds are dropped.
+    fn seconds(ms: &str) -> String {
+        match ms.trim().parse::<i64>() {
+            Ok(v) if v > 0 => (v / 1000).to_string(),
+            _ => "0".to_string(),
+        }
+    }
+
+    /// Puts the next row in the buffer as a bodyfile line.
+    fn fill(&mut self) {
+        self.buf.clear();
+        self.pos = 0;
+        while !self.done {
+            match read_csv_record(&mut self.reader, &mut self.fields) {
+                Ok(true) => {}
+                _ => {
+                    self.done = true;
+                    return;
+                }
+            }
+            let get = |i: usize| self.cols[i].and_then(|c| self.fields.get(c)).map(|s| s.as_str()).unwrap_or("");
+            let name = get(1);
+            if name.is_empty() {
+                continue; // a blank line of the table
+            }
+            if self.host.is_none() {
+                self.host = self.host_col.and_then(|c| self.fields.get(c)).map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+            }
+            let md5 = if get(0).trim().is_empty() { "0" } else { get(0).trim() };
+            // a line break or a separator inside a name would split the line
+            let name = name.replace(['\n', '\r'], " ");
+            let line = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                md5,
+                name,
+                get(2).trim(),
+                get(3).trim(),
+                get(4).trim(),
+                get(5).trim(),
+                get(6).trim(),
+                Self::seconds(get(7)),
+                Self::seconds(get(8)),
+                Self::seconds(get(9)),
+                Self::seconds(get(10)),
+            );
+            self.buf.extend_from_slice(line.as_bytes());
+            return;
+        }
+    }
+}
+
+impl<R: BufRead> std::io::Read for CortexListing<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            if self.done {
+                return Ok(0);
+            }
+            self.fill();
+            if self.buf.is_empty() {
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 /// Parses a bodyfile stream and returns the entries together with a report
 /// of how many lines were accepted or rejected. Lines that are not valid
 /// UTF-8 (raw bytes in file names, as emitted by `fls -m`) are decoded
@@ -265,6 +427,52 @@ pub fn parse_bodyfile_stream<R: BufRead>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    const LISTING: &str = "name,inode,mode_as_string,uid,gid,size,atime,mtime,ctime,crtime,md5,generated_time,agent_id,host_name\n\
+/etc/passwd,4230,-rw-r--r--,0,0,2323,1710234798123,1710234798000,1710247956000,1710000000000,d41d8cd98f00b204e9800998ecf8427e,2026-11-01T10:00:00Z,a1,websrv01\n\
+\"/srv/a, \"\"b\"\".txt\",77,-rw-r--r--,1000,1000,5,0,1710234799000,1710234799000,,,2026-11-01T10:00:00Z,a1,websrv01\n";
+
+    #[test]
+    fn a_cortex_listing_comes_out_as_bodyfile_lines() {
+        let mut listing = CortexListing::open(Cursor::new(LISTING)).expect("the table is recognised");
+        assert_eq!(listing.host(), Some("websrv01"));
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut listing, &mut body).unwrap();
+        assert_eq!(
+            body,
+            "d41d8cd98f00b204e9800998ecf8427e|/etc/passwd|4230|-rw-r--r--|0|0|2323|1710234798|1710234798|1710247956|1710000000\n\
+0|/srv/a, \"b\".txt|77|-rw-r--r--|1000|1000|5|0|1710234799|1710234799|0\n"
+        );
+    }
+
+    #[test]
+    fn a_cortex_listing_gives_the_same_rows_as_its_bodyfile() {
+        let listing = CortexListing::open(Cursor::new(LISTING)).unwrap();
+        let from_table = parse_bodyfile_stream(std::io::BufReader::new(listing), Some("websrv01"));
+        let body = "d41d8cd98f00b204e9800998ecf8427e|/etc/passwd|4230|-rw-r--r--|0|0|2323|1710234798|1710234798|1710247956|1710000000\n\
+0|/srv/a, \"b\".txt|77|-rw-r--r--|1000|1000|5|0|1710234799|1710234799|0\n";
+        let from_body = parse_bodyfile_stream(Cursor::new(body), Some("websrv01"));
+        assert!(!from_table.is_empty());
+        assert_eq!(from_table.len(), from_body.len());
+        // a line's rows come out in no fixed order: compared as sets
+        let rows = |v: &[TimelineEntry]| {
+            let mut r: Vec<(String, String, Option<String>)> = v.iter().map(|e| (e.file_name.clone(), e.timestamp.clone(), e.host.as_deref().map(str::to_string))).collect();
+            r.sort();
+            r
+        };
+        assert_eq!(rows(&from_table), rows(&from_body));
+    }
+
+    #[test]
+    fn another_table_is_not_a_cortex_listing() {
+        assert!(CortexListing::open(Cursor::new("name,size,owner\n/etc/passwd,10,root\n")).is_none());
+        assert!(CortexListing::open(Cursor::new("")).is_none());
+        // the header alone: recognised, and empty
+        let mut empty = CortexListing::open(Cursor::new("name,inode,mode_as_string,uid,gid,size,atime,mtime,ctime,crtime,md5,host_name\n")).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut empty, &mut body).unwrap();
+        assert!(body.is_empty() && empty.host().is_none());
+    }
 
     #[test]
     fn test_parse_bodyfile_stream() {

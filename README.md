@@ -94,6 +94,7 @@ All 19 columns, what each source fills, exit codes and error codes: [Output →]
 | `$MFT` | name (`$MFT`, `_MFT`) or `FILE`/`BAAD` signature | 1 KiB and 4 KiB records, `$ATTRIBUTE_LIST` followed, resident files dumped with `-r` |
 | `$UsnJrnl:$J` | `-u`, or name (`$UsnJrnl%3A$J`, `$J` under `$Extend`) | USN V2 and V3; V4 range records skipped and counted |
 | Bodyfile (TSK 3.x) | name (`bodyfile`, `*.body`) or content | UAC and other Linux collectors |
+| Cortex XDR online triage (the zip the console offers for download) | its file listing, `bodyfile/bodyfile.csv`: a bodyfile written as a table, times in milliseconds | Read as the bodyfile it is, times to the whole second. The host is the `host_name` column of the table, not the name of the download. A package with no file listing has nothing for allymacb |
 | E01 / EWF | `.e01`, `.ex01` | |
 | Raw images | `.dd`, `.raw`, `.img`, split `.001`, or boot sector / GPT / MBR | GPT, MBR with extended partitions, 512 and 4096-byte sectors; NTFS, ext4, XFS and LVM partitions timelined |
 | Fixed VHD | footer | |
