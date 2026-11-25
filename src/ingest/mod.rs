@@ -4,6 +4,7 @@ pub mod carve_text;
 pub mod device;
 pub mod image;
 pub mod triage;
+pub mod qcow2;
 pub mod vdisk;
 pub mod vhd;
 pub mod vmdk;
@@ -62,7 +63,7 @@ impl Drop for EvidenceWorkspace {
 pub fn is_image_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "dd" | "raw" | "img" | "001" | "e01" | "ex01" | "vmdk" | "vhd" | "vhdx"
+        "dd" | "raw" | "img" | "001" | "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "qcow2" | "qcow"
     )
 }
 

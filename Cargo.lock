@@ -75,6 +75,7 @@ dependencies = [
  "walkdir",
  "windows-sys",
  "zip",
+ "zstd",
 ]
 
 [[package]]

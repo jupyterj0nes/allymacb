@@ -1,8 +1,10 @@
 //! Virtual disks: the repository's raw fixtures (`gpt_xfs.img`, `mbr_lvm_ext4.img`) wrapped
 //! in every container allymacb decodes (VMDK monolithic sparse, VMDK streamOptimized, VMDK
-//! descriptor with a flat extent, dynamic VHD, VHDX) must give exactly the rows of the raw
+//! descriptor with a flat extent, dynamic VHD, VHDX, QCOW2 plain and compressed, a QCOW2
+//! overlay over its raw backing file) must give exactly the rows of the raw
 //! image, the evidence name aside. Then the refusals (differencing disks, missing extents,
-//! QCOW) with their exit code and error code, and two lab images (skipped where absent).
+//! QCOW2 encrypted, without its backing file or not a QCOW2 at all) with their exit code
+//! and error code, and two lab images (skipped where absent).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -281,6 +283,61 @@ fn vhdx(raw: &[u8], with_parent: bool) -> Vec<u8> {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+/// A QCOW2 (version 3, 64 KiB clusters) of `raw`: clusters of zeros left out, the others
+/// stored or, with `packed`, compressed with raw deflate as `qemu-img convert -c` does.
+/// With `backing`, an overlay: only the clusters from `keep_from` on are its own, the rest
+/// is read from the file it names.
+fn qcow2(raw: &[u8], packed: bool, backing: Option<(&str, usize)>, crypt: u32) -> Vec<u8> {
+    let cs = 65536usize;
+    let clusters = raw.len().div_ceil(cs);
+    let tables = clusters.div_ceil(cs / 8);
+    let mut img = vec![0u8; cs * (2 + tables)];
+    img[..4].copy_from_slice(b"QFI\xfb");
+    img[4..8].copy_from_slice(&3u32.to_be_bytes());
+    img[20..24].copy_from_slice(&16u32.to_be_bytes());
+    img[24..32].copy_from_slice(&(raw.len() as u64).to_be_bytes());
+    img[32..36].copy_from_slice(&crypt.to_be_bytes());
+    img[36..40].copy_from_slice(&(tables as u32).to_be_bytes());
+    img[40..48].copy_from_slice(&(cs as u64).to_be_bytes());
+    img[96..100].copy_from_slice(&4u32.to_be_bytes());
+    img[100..104].copy_from_slice(&104u32.to_be_bytes());
+    if let Some((name, _)) = backing {
+        img[8..16].copy_from_slice(&200u64.to_be_bytes());
+        img[16..20].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        img[200..200 + name.len()].copy_from_slice(name.as_bytes());
+    }
+    for t in 0..tables {
+        img[cs + t * 8..cs + t * 8 + 8].copy_from_slice(&((cs * (2 + t)) as u64).to_be_bytes());
+    }
+    let keep_from = backing.map(|(_, k)| k).unwrap_or(0);
+    for (i, chunk) in raw.chunks(cs).enumerate() {
+        if i < keep_from || (backing.is_none() && chunk.iter().all(|&b| b == 0)) {
+            continue;
+        }
+        let mut cluster = chunk.to_vec();
+        cluster.resize(cs, 0);
+        let entry = if packed {
+            let mut e = flate2::write::DeflateEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&cluster).unwrap();
+            let z = e.finish().unwrap();
+            let at = img.len() as u64;
+            img.extend_from_slice(&z);
+            let sectors = (at % 512 + z.len() as u64).div_ceil(512) - 1;
+            (1u64 << 62) | sectors << 54 | at
+        } else {
+            let at = img.len().div_ceil(cs) * cs;
+            img.resize(at, 0);
+            img.extend_from_slice(&cluster);
+            at as u64
+        };
+        let o = cs * 2 + i * 8;
+        img[o..o + 8].copy_from_slice(&entry.to_be_bytes());
+    }
+    let end = img.len().div_ceil(cs) * cs;
+    img.resize(end, 0);
+    img
+}
+
 fn same_rows_in_every_container(name: &str, tag: &str) {
     let raw = raw_fixture(name);
     let d = tmpdir(tag);
@@ -316,7 +373,18 @@ RW {} FLAT \"{name}-flat.vmdk\" 0
     std::fs::write(&dyn_vhd, dynamic_vhd(&raw)).unwrap();
     let vx = sub("vhdx").join(format!("{name}.vhdx"));
     std::fs::write(&vx, vhdx(&raw, false)).unwrap();
-    for p in [&sparse, &stream, &desc, &dyn_vhd, &vx] {
+    let q_plain = sub("qcow2").join(format!("{name}.qcow2"));
+    std::fs::write(&q_plain, qcow2(&raw, false, None, 0)).unwrap();
+    let q_packed = sub("qcow2z").join(format!("{name}.qcow2"));
+    std::fs::write(&q_packed, qcow2(&raw, true, None, 0)).unwrap();
+    // an overlay: the first 2 MiB only in the backing file, named as the hypervisor had it
+    let over_dir = sub("overlay");
+    let mut base = raw[..2 << 20].to_vec();
+    base.resize(raw.len(), 0);
+    std::fs::write(over_dir.join("base.bin"), &base).unwrap();
+    let q_over = over_dir.join(format!("{name}.qcow2"));
+    std::fs::write(&q_over, qcow2(&raw, false, Some(("/var/lib/libvirt/images/base.bin", 32)), 0)).unwrap();
+    for p in [&sparse, &stream, &desc, &dyn_vhd, &vx, &q_plain, &q_packed, &q_over] {
         let (code, rows, err) = run(p);
         assert_eq!(code, 0, "{}: {err}", p.display());
         assert_eq!(rows.len(), want.len(), "{}: row count", p.display());
@@ -349,6 +417,9 @@ fn refusals_exit_2_with_their_codes() {
         (d.join("lost.vmdk"), b"# Disk DescriptorFile\ncreateType=\"monolithicFlat\"\nRW 8 FLAT \"lost-flat.vmdk\" 0\n".to_vec(), "ERR_IMAGE_EXTENT_MISSING_6006"),
         (d.join("delta.vmdk"), b"# Disk DescriptorFile\nparentCID=1234abcd\nparentFileNameHint=\"base.vmdk\"\ncreateType=\"monolithicSparse\"\nRW 8 SPARSE \"x.vmdk\"\n".to_vec(), "ERR_IMAGE_HAS_PARENT_6005"),
         (d.join("disk.img"), { let mut q = b"QFI\xfb".to_vec(); q.resize(4096, 0); q }, "ERR_IMAGE_UNSUPPORTED_6003"),
+        (d.join("luks.qcow2"), qcow2(&raw[..1 << 20], false, None, 2), "ERR_IMAGE_UNSUPPORTED_6003"),
+        (d.join("orphan.qcow2"), qcow2(&raw[..1 << 20], false, Some(("gone.qcow2", 4)), 0), "ERR_IMAGE_EXTENT_MISSING_6006"),
+        (d.join("cut.qcow2"), { let q = qcow2(&raw[..1 << 20], false, None, 0); q[..60000].to_vec() }, "ERR_IMAGE_CONTAINER_DAMAGED_6004"),
     ];
     for (p, bytes, code) in cases {
         std::fs::write(&p, bytes).unwrap();

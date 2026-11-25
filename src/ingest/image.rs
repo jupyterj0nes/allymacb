@@ -40,9 +40,9 @@ pub struct PartitionInfo {
 }
 
 /// Virtual-disk container formats that are not raw, detected by signature. VMDK (sparse,
-/// streamOptimized, descriptor), dynamic VHD and VHDX are decoded ([`super::vmdk`],
-/// [`super::vhd`]); QCOW and VDI are refused with a clear error instead of an empty
-/// timeline.
+/// streamOptimized, descriptor), dynamic VHD, VHDX and QCOW2 are decoded ([`super::vmdk`],
+/// [`super::vhd`], [`super::qcow2`]); VDI is refused with a clear error instead of an
+/// empty timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerFormat {
     Vhdx,
@@ -60,7 +60,7 @@ impl ContainerFormat {
             ContainerFormat::VmdkSparse => "VMDK sparse extent",
             ContainerFormat::VmdkDescriptor => "VMDK descriptor file",
             ContainerFormat::VhdDynamic => "dynamic/differencing VHD",
-            ContainerFormat::Qcow => "QCOW/QCOW2 image",
+            ContainerFormat::Qcow => "QCOW2 image",
             ContainerFormat::Vdi => "VirtualBox VDI",
         }
     }
@@ -786,8 +786,8 @@ pub fn parse_forensic_image(
 /// Buffer of the readers over a virtual disk: a few grains or blocks per refill.
 const VDISK_BUFFER: usize = 256 * 1024;
 
-/// A VMDK, dynamic VHD or VHDX opened as the virtual disk it holds and walked like a raw
-/// image; the other containers are refused (E6003).
+/// A VMDK, dynamic VHD, VHDX or QCOW2 opened as the virtual disk it holds and walked like
+/// a raw image; the other containers are refused (E6003).
 fn parse_virtual_disk(image_path: &Path, fmt: ContainerFormat, label: &str, mft_options: &MftParseOptions, temp_dir: &Path) -> Result<(Vec<TimelineEntry>, ResidentStats)> {
     let quiet = mft_options.quiet;
     let gb = |b: u64| b as f64 / 1_073_741_824.0;
@@ -828,7 +828,33 @@ fn parse_virtual_disk(image_path: &Path, fmt: ContainerFormat, label: &str, mft_
             }
             parse_partitions(BufReader::with_capacity(VDISK_BUFFER, r), total, label, mft_options, temp_dir)
         }
-        ContainerFormat::Qcow | ContainerFormat::Vdi => Err(unsupported_container(label, fmt)),
+        ContainerFormat::Qcow => {
+            let r = super::qcow2::Qcow2Reader::open(&image_path.to_string_lossy()).map_err(|e| qcow_error(e).into_ally(label))?;
+            let total = r.total_size();
+            if !quiet {
+                crate::say!("    [i] QCOW2: {:.1} GB virtual disk", gb(total));
+            }
+            parse_partitions(BufReader::with_capacity(VDISK_BUFFER, r), total, label, mft_options, temp_dir)
+        }
+        ContainerFormat::Vdi => Err(unsupported_container(label, fmt)),
+    }
+}
+
+/// The code of a QCOW2 that could not be opened, from what its reader says: a backing
+/// file that is not there (E6006), a kind of image that is not read (encrypted, external
+/// data file, QCOW 1, a remote or foreign backing file: E6003), the file itself not
+/// readable (E6001), else a header or a table that cannot be trusted (E6004).
+fn qcow_error(message: String) -> super::vdisk::DiskError {
+    use super::vdisk::DiskError;
+    let unsupported = ["encrypted", "external data file", "version", "does not know", "not a local file", "not followed"];
+    if message.contains("which is not there") {
+        DiskError::missing(message)
+    } else if unsupported.iter().any(|w| message.contains(w)) {
+        DiskError::new(ErrorCode::ImageUnsupportedFormat, message)
+    } else if message.starts_with("cannot open") || message.starts_with("cannot stat") || message.starts_with("cannot read") {
+        DiskError::read(message)
+    } else {
+        DiskError::damaged(message)
     }
 }
 
